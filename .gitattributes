@@ -1,0 +1,16 @@
+# Normalize text line endings to LF on commit — prevents whole-file CRLF
+# churn in diffs (UE on Windows otherwise flips entire files to CRLF).
+* text=auto eol=lf
+
+# Binary assets — never normalize.
+*.uasset binary
+*.umap   binary
+*.fbx    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.wav    binary
+*.dll    binary
+*.lib    binary
+*.dylib  binary
+*.pdb    binary

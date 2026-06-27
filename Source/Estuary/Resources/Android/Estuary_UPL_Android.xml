@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SCAF-06: Android permissions. Phase 5 (MIC-07) wires runtime mic permission; Phase 7 (CAM-05) wires camera. -->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Declare manifest permissions used by later phases -->
+    <androidManifestUpdates>
+        <addPermission android:name="android.permission.RECORD_AUDIO" />
+        <addPermission android:name="android.permission.CAMERA" />
+        <addPermission android:name="android.permission.INTERNET" />
+        <addPermission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    </androidManifestUpdates>
+
+    <!-- TODO(Phase 5): add <addFeature android:name="android.hardware.microphone" android:required="false" /> -->
+    <!-- CAM-05 / T-07-11: Camera hardware feature. required="false" so the app installs on
+         camera-less devices; runtime consent gate (bHasUserConsent) is the actual guard.
+         Phase 7 verified and added. -->
+    <addFeature android:name="android.hardware.camera"
+                android:required="false" />
+    <!-- TODO(Phase 8): add WebRTC wrapper Gradle deps here when EstuaryLiveKit lands on Android (v1.1) -->
+</root>

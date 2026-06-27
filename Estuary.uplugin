@@ -1,0 +1,56 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "Estuary",
+  "Description": "Real-time AI voice and text conversation SDK — Socket.IO + optional LiveKit WebRTC, MetaHuman ARKit-52 lipsync.",
+  "Category": "Runtime",
+  "CreatedBy": "Estuary AI",
+  "CreatedByURL": "https://estuary-ai.com",
+  "EnabledByDefault": true,
+  "CanContainContent": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "Estuary",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Win64", "Mac", "IOS", "Android"]
+    },
+    {
+      "Name": "EstuaryLiveKit",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "Optional": true,
+      "PlatformAllowList": ["Win64", "Mac"]
+    },
+    {
+      "Name": "EstuaryLiveLink",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Win64", "Mac", "IOS", "Android"]
+    },
+    {
+      "Name": "EstuaryEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": ["Win64", "Mac"]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "SocketIOClient",
+      "Enabled": true,
+      "Optional": true
+    },
+    {
+      "Name": "RuntimeAudioImporter",
+      "Enabled": true,
+      "Optional": true
+    },
+    {
+      "Name": "LiveLink",
+      "Enabled": true
+    }
+  ]
+}

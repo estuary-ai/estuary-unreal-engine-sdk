@@ -1,0 +1,50 @@
+# GSD planning artifacts (local-only by project preference)
+.planning/
+
+# Optional LiveKit prebuilts — fetched by ThirdParty/Setup.{ps1,sh}, never committed.
+ThirdParty/livekit-client-sdk-cpp/
+
+# Unreal Engine
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+*.pdb
+*.sln
+*.xcworkspace
+*.xcodeproj
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Local-only secrets — the dev Auth Token persists here via UEstuarySecretSettings
+# (config = EstuarySecret, defaultconfig). NEVER commit a real est_ key.
+Config/DefaultEstuarySecret.ini
+Config/*Secret*.ini
+
+# Internal AI-agent guidance — kept locally, not published.
+CLAUDE.md
+
+# Internal authoring/handoff scratch docs must never be swept in by `git add .`.
+*_HANDOFF.md
+
+# Visual Studio temp
+*.suo
+*.VC.db
+*.opensdf
+*.sdf
+*.tmp
+
+# Internal QA matrix + agent-task build specs — not user-facing docs; kept local.
+QA_MATRIX.md
+L_SDK_Testbed_SPEC.md
+L_SDK_Testbed_IMPLEMENTATION_NOTES.md

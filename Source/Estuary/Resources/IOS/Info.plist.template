@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SCAF-06: iOS permission strings. Phase 5 (MIC-07) wires mic permission request; Phase 7 (CAM-05) wires camera. -->
+<!-- Note: NSAppTransportSecurity / NSAllowsArbitraryLoads is intentionally omitted.
+     Production connections use wss:// — see PITFALLS.md Pitfall 13. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>This app uses the microphone for conversational AI voice input.</string>
+    <!-- CAM-05: NSCameraUsageDescription present from SCAF-06. Phase 7 verified. -->
+    <key>NSCameraUsageDescription</key>
+    <string>This app uses the camera for visual context to the AI assistant.</string>
+</dict>
+</plist>
