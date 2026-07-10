@@ -34,10 +34,6 @@ class UEstuaryCharacterComponent;
 // Full header is included in EstuarySubsystem.cpp only (Pitfall 21).
 class UEstuaryCameraComponent;
 
-// Forward-declare FJsonObject for EmitBindPose signature.
-// Full header "Dom/JsonObject.h" included in EstuarySubsystem.cpp only.
-class FJsonObject;
-
 // ---------------------------------------------------------------------------
 // Delegate declarations — one per Blueprint output pin.
 // USTRUCT(BlueprintType) payloads keep us under the 8-param cap (Pitfall 16).
@@ -66,6 +62,23 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryQuotaExceeded,
 /** Fired when the gateway pushes `memory_updated` after background memory extraction. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryMemoryUpdated,
     const FEstuaryMemoryUpdated&, MemoryUpdated);
+
+/** Fired when the gateway reaps the session for inactivity (`session_timeout`).
+ *  The gateway disconnects right after; the SDK will NOT auto-reconnect. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuarySessionTimeout,
+    const FEstuarySessionTimeout&, SessionTimeout);
+
+/** Fired when the gateway releases voice resources for voice inactivity (`voice_timeout`).
+ *  The socket stays connected; text chat continues. Local voice state is already released. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryVoiceTimeout,
+    const FEstuaryVoiceTimeout&, VoiceTimeout);
+
+/** Fired when the server confirms the voice pipeline is live (`livekit_ready`).
+ *  Fires after every LiveKit join, including the auto-rejoin on the first
+ *  StartListening after a voice_timeout. WebSocket voice has no server ack,
+ *  so this never fires in pure-WebSocket mode. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryVoiceReady,
+    const FString&, Room);
 
 /** Fired on every EEstuarySessionState transition, including Reconnecting and Error. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuarySessionStateChanged,
@@ -289,13 +302,6 @@ public:
                     ToolTip="Emit a JPEG camera frame to the backend. Called internally by UEstuaryCameraComponent::SendCameraFrame."))
     void EmitCameraImage(const FEstuaryCameraImage& Payload);
 
-    /** Optional per-character bind-pose handshake — emit bind_pose via the bridge.
-     *  The body receiver currently relies on the server's identity-bind fallback
-     *  and does not emit one, so this is unused by default; call it on the game
-     *  thread if a custom topology needs to register a bind pose.
-     *  Payload = {bones: {<gestureSync_bone_name>: [qx,qy,qz,qw]}}. */
-    void EmitBindPose(const TSharedRef<FJsonObject>& Payload);
-
     /** Emit user head floor xy for GestureSync dyadic conditioning (paper p_y).
      *  Call at the motion frame rate (~30 Hz) while a GestureSync session is
      *  active; the helper component UEstuaryUserPositionComponent does this
@@ -433,6 +439,15 @@ public:
                       ToolTip = "CharacterId currently owning the voice session, empty if none."))
     FString GetActiveVoiceCharacterId() const { return ActiveVoiceCharacterId; }
 
+    /** True after a voice_timeout released the voice lane and before the next
+     *  successful voice re-establishment (livekit_ready) or a fresh Connect().
+     *  Poll from UI (e.g. on Tick) to show the auto-muted state without binding
+     *  OnVoiceTimeout/OnVoiceReady. */
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Estuary|Voice",
+              meta = (DisplayName = "Is Voice Suspended",
+                      ToolTip = "True between a voice_timeout release and the next confirmed voice re-establishment (livekit_ready). Show the mic as auto-muted while true."))
+    bool IsVoiceSuspended() const { return bVoiceSuspended; }
+
     // -----------------------------------------------------------------------
     // Blueprint-assignable delegates
     // -----------------------------------------------------------------------
@@ -468,6 +483,34 @@ public:
               meta = (ToolTip = "Bind to receive newly extracted memories after a conversation ends (memory_updated)."))
     FOnEstuaryMemoryUpdated OnMemoryUpdated;
 
+    /** Fires on `session_timeout` — the server reaped an idle session. The gateway
+     *  disconnects right after and the SDK does NOT auto-reconnect (reconnecting would
+     *  re-establish billed voice resources with nobody talking, in a loop). Surface
+     *  "Session ended due to inactivity" and require explicit user intent to Connect() again. */
+    UPROPERTY(BlueprintAssignable, Category = "Estuary|Events",
+              meta = (ToolTip = "Bind to handle server idle reaps (session_timeout). No auto-reconnect follows; call Connect() on explicit user intent."))
+    FOnEstuarySessionTimeout OnSessionTimeout;
+
+    /** Fires on `voice_timeout` — the server released voice resources after voice
+     *  inactivity while the session stayed alive (e.g. the user kept texting). The socket
+     *  STAYS CONNECTED and text continues; the SDK has already stopped the mic and
+     *  released the voice transport. Recommended UX: show the mic as auto-muted and
+     *  start a fresh voice session (StartListening) when the user unmutes. */
+    UPROPERTY(BlueprintAssignable, Category = "Estuary|Events",
+              meta = (ToolTip = "Bind to handle voice-idle releases (voice_timeout). Socket stays connected; show the mic as auto-muted and restart voice on user intent."))
+    FOnEstuaryVoiceTimeout OnVoiceTimeout;
+
+    /** Fires on `livekit_ready` — the server confirms the bot joined the room and the
+     *  STT pipeline is armed. Speech before this can land on a cold pipeline and be
+     *  lost (a LiveKit join takes ~1s, plus server STT warmup). Fires after EVERY join,
+     *  including the auto-rejoin triggered by the first StartListening after a
+     *  voice_timeout. Recommended UX: show "connecting voice…" from StartListening
+     *  until this fires, then "voice ready". Never fires in pure-WebSocket voice mode
+     *  (no server ack exists there). */
+    UPROPERTY(BlueprintAssignable, Category = "Estuary|Events",
+              meta = (ToolTip = "Fires when the server confirms the voice pipeline is live (livekit_ready). Show 'connecting voice' from StartListening until this fires — earlier speech can be lost to the cold join."))
+    FOnEstuaryVoiceReady OnVoiceReady;
+
     /** Fires on every state transition. Useful for UI (connecting spinner, error banner). */
     UPROPERTY(BlueprintAssignable, Category = "Estuary|Events",
               meta = (ToolTip = "Fires on every EEstuarySessionState transition including Reconnecting and Error."))
@@ -501,6 +544,21 @@ private:
 
     /** Handle for the one-shot FTSTicker reconnect callback. Reset after firing. */
     FTSTicker::FDelegateHandle ReconnectHandle;
+
+    /** Set by HandleSessionTimeout: the SERVER ended this session (idle reap) and will
+     *  disconnect the socket right after. Suppresses the auto-reconnect that
+     *  HandleTransportClosed would otherwise schedule — reconnecting would re-auth and
+     *  re-establish billed voice resources with nobody talking, in a loop
+     *  (SDK_CONTRACT §session_timeout). Cleared only by an explicit Connect() (user intent).
+     *  Guarded in BOTH HandleTransportClosed and TickReconnect: the session_timeout event
+     *  and the transport close are marshaled to the game thread independently, so the
+     *  close can land first and schedule a reconnect before this flag is set. */
+    bool bServerEndedSession = false;
+
+    /** True between a voice_timeout release and the next confirmed voice
+     *  re-establishment (livekit_ready) or a fresh Connect(). Read via
+     *  IsVoiceSuspended() for polling UIs. */
+    bool bVoiceSuspended = false;
 
     // -----------------------------------------------------------------------
     // Internal helpers
@@ -544,6 +602,28 @@ private:
 
     /** Receive `memory_updated` from bridge (game-thread guaranteed). Broadcasts OnMemoryUpdated. */
     void HandleMemoryUpdated(const FEstuaryMemoryUpdated& Memory);
+
+    /** Receive `session_timeout` from bridge (game-thread guaranteed). Sets
+     *  bServerEndedSession (reconnect suppression), releases local voice resources,
+     *  and broadcasts OnSessionTimeout. Does NOT SetState — the transport close that
+     *  immediately follows drives the state machine (same pattern as quota_exceeded). */
+    void HandleSessionTimeout(const FEstuarySessionTimeout& Timeout);
+
+    /** Receive `voice_timeout` from bridge (game-thread guaranteed). Releases local
+     *  voice resources (mic off, LiveKit room disposed — it is already deleted
+     *  server-side) and broadcasts OnVoiceTimeout. The socket stays connected; text
+     *  continues. NEVER touches bServerEndedSession (no disconnect follows). */
+    void HandleVoiceTimeout(const FEstuaryVoiceTimeout& Timeout);
+
+    /** Release LOCAL voice resources without emitting anything to the server:
+     *  stop mic capture on the active (or all) registered characters WITHOUT
+     *  stop_voice, dispose the LiveKit room client-side WITHOUT livekit_leave
+     *  (the server has already torn its side down), and clear
+     *  ActiveVoiceCharacterId. Used by voice_timeout / session_timeout / any
+     *  transport close of a voice-active session — the stale-voice-state bug
+     *  class: an unprocessed server-side teardown leaves a hot mic and a
+     *  "voice already active" client. Idempotent. */
+    void ReleaseVoiceResourcesLocal(const TCHAR* Context);
 
     void HandleTransportConnected();
     void HandleTransportClosed(int32 CloseCode, const FString& Reason);

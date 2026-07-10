@@ -150,6 +150,16 @@ struct ESTUARY_API FEstuaryAnimationModalityCapability
               meta = (DisplayName = "Provider",
                       ToolTip = "Active provider name for this modality (e.g. a2f / sarah). Empty when inactive."))
     FString Provider;
+
+    /** Wire rig identifier for this modality. Body reports "mhr63" (MHR 63-joint
+     *  GestureSync wire). Empty when the server predates the rig field or the
+     *  modality doesn't carry one (face). The body receiver hard-checks
+     *  Body.Rig — a mismatch disables the receiver with a loud Error log
+     *  (no silent frame drops between mixed client/server versions). */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Session",
+              meta = (DisplayName = "Rig",
+                      ToolTip = "Wire rig identifier (body: \"mhr63\"). Empty on older servers or for modalities without a rig."))
+    FString Rig;
 };
 
 // ---------------------------------------------------------------------------
@@ -174,7 +184,7 @@ struct ESTUARY_API FEstuaryAnimationCapabilities
               meta = (DisplayName = "Face"))
     FEstuaryAnimationModalityCapability Face;
 
-    /** Body (SMPL-X 52-bone / GestureSync) modality gate. */
+    /** Body (MHR 63-joint GestureSync) modality gate. Body.Rig carries the wire rig id ("mhr63"). */
     UPROPERTY(BlueprintReadOnly, Category = "Estuary|Session",
               meta = (DisplayName = "Body"))
     FEstuaryAnimationModalityCapability Body;
@@ -363,6 +373,77 @@ struct ESTUARY_API FEstuaryQuotaExceeded
     UPROPERTY(BlueprintReadOnly, Category = "Estuary|Error",
               meta = (DisplayName = "Tier", ToolTip = "Subscription tier (e.g. free / pro). Empty when the server omits it (share-limit variant)."))
     FString Tier;
+};
+
+// ---------------------------------------------------------------------------
+// FEstuarySessionTimeout — Server -> Client `session_timeout` event payload.
+// Wire contract: SDK_CONTRACT.md §session_timeout.
+//
+// A voice-ACTIVE session had no conversation activity for TimeoutSeconds.
+// The gateway FORCE-CLOSES the session immediately after emitting this (socket
+// disconnected, LiveKit room deleted server-side — billing stops). The
+// subsystem suppresses its auto-reconnect for the disconnect that follows;
+// resuming requires an explicit Connect() (user intent), which starts a NEW
+// session.
+// ---------------------------------------------------------------------------
+
+/** Server idle reap notification. The gateway disconnects right after; the SDK
+ *  will NOT auto-reconnect (that would re-establish billed voice resources in a loop). */
+USTRUCT(BlueprintType)
+struct ESTUARY_API FEstuarySessionTimeout
+{
+    GENERATED_BODY()
+
+    /** Machine-readable reason. Wire key: "reason". Currently always "inactivity". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Session",
+              meta = (DisplayName = "Reason", ToolTip = "Why the server ended the session. Currently always 'inactivity'."))
+    FString Reason;
+
+    /** How long the session was idle when reaped, in seconds. Wire key: "idle_seconds". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Session",
+              meta = (DisplayName = "Idle Seconds", ToolTip = "Observed idle time in seconds when the server reaped the session."))
+    int32 IdleSeconds = 0;
+
+    /** The server's configured idle timeout, in seconds. Wire key: "timeout_seconds". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Session",
+              meta = (DisplayName = "Timeout Seconds", ToolTip = "Server idle-timeout threshold in seconds (SESSION_IDLE_TIMEOUT_S)."))
+    int32 TimeoutSeconds = 0;
+};
+
+// ---------------------------------------------------------------------------
+// FEstuaryVoiceTimeout — Server -> Client `voice_timeout` event payload.
+// Wire contract: SDK_CONTRACT.md §voice_timeout.
+//
+// A voice-ACTIVE session heard no USER SPEECH for TimeoutSeconds while other
+// activity (text chat) kept the session alive. The server released ONLY the
+// voice resources (STT closed, LiveKit room deleted server-side) — the socket
+// STAYS CONNECTED and text continues. Opposite of session_timeout: no
+// disconnect follows, so this must never feed the reconnect-suppression path.
+// Recommended UX: auto-mute illusion — keep the call UI open, show the mic as
+// muted, and start a FRESH voice session when the user unmutes.
+// ---------------------------------------------------------------------------
+
+/** Voice-lane idle release. Socket stays connected; text chat continues.
+ *  Local voice state has already been released by the SDK when this fires. */
+USTRUCT(BlueprintType)
+struct ESTUARY_API FEstuaryVoiceTimeout
+{
+    GENERATED_BODY()
+
+    /** Machine-readable reason. Wire key: "reason". Currently always "voice_inactivity". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Voice",
+              meta = (DisplayName = "Reason", ToolTip = "Why the server released voice resources. Currently always 'voice_inactivity'."))
+    FString Reason;
+
+    /** How long the voice lane was idle when released, in seconds. Wire key: "idle_seconds". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Voice",
+              meta = (DisplayName = "Idle Seconds", ToolTip = "Observed voice-idle time in seconds (no user speech)."))
+    int32 IdleSeconds = 0;
+
+    /** The server's configured voice-idle timeout, in seconds. Wire key: "timeout_seconds". */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Voice",
+              meta = (DisplayName = "Timeout Seconds", ToolTip = "Server voice-idle threshold in seconds (VOICE_IDLE_TIMEOUT_S)."))
+    int32 TimeoutSeconds = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -918,23 +999,25 @@ struct ESTUARY_API FEstuaryBotAnimation
 
 // ---------------------------------------------------------------------------
 // FEstuaryBotPoseBone / FEstuaryBotPose — Server -> Client `bot_pose` event payload.
-// Wire contract: SDK_CONTRACT.md §body_animation_stream (Phase 4 — GestureSync).
+// Wire contract: SDK_CONTRACT.md §body_animation_stream (MHR63 GestureSync).
 //
-// Phase 3.5 WIRE-09: bone count is 52 (= 22 body + 30 finger). Body 0..21 is
-// byte-identical to the legacy v10 22-bone wire order (stable-prefix invariant);
-// fingers 22..51 follow the standard SMPL-X joint_names order:
-//   left/right × index, middle, pinky, ring, thumb × 3 phalanges (1=proximal,
-//   3=distal). The receiver iterates Bones.Num() — never assumes a fixed count.
+// Bone count is exactly 63 — the MHR (Momentum Human Rig) wire subset in the
+// canonical wire order (authority: SARAH models/rig.py via the generated
+// EstuaryMHRRig.h): 0 root; 1-7 left leg; 8-14 right leg; 15-18 c_spine0..3;
+// 19-22 r_clavicle..r_wrist; 23-39 right fingers; 40-43 l_clavicle..l_wrist;
+// 44-60 left fingers; 61 c_neck; 62 c_head. Quats are LOCAL joint rotations in
+// the MHR canonical frame (RH, +Y up, +Z forward), xyzw, w >= 0 per frame with
+// per-bone cross-chunk sign-linking server-side. Identity != rest: at rest the
+// locals equal MHR's A-pose rest local frames, NOT identity quats.
 //
 // Wire shape:
 //   {
 //     message_id: string,
 //     sequence: number,                    // 0-based; -1 on terminator
 //     time_code_sec: number,               // seconds from utterance start
-//     fps: number,                         // always 30 for v2.0
-//     bones: Array<{name: string, quat: [x,y,z,w]}>,    // 52 SMPL-X canonical bones
-//     hips_world: [x,y,z],                 // SMPL-X canonical meters
-//     hips_local_to_floor: [x,y,z],        // SMPL-X canonical meters
+//     fps: number,                         // always 30
+//     bones: Array<{name: string, quat: [x,y,z,w]}>,    // 63 MHR wire bones, LOCAL quats
+//     hips_world: [x,y,z],                 // root-position delta, meters, agent frame
 //     emit_epoch_ms: number,
 //     is_final: boolean                    // true only on terminator (sequence==-1, bones==[])
 //   }
@@ -945,30 +1028,34 @@ struct ESTUARY_API FEstuaryBotAnimation
 
 /** Single bone entry within a bot_pose frame.
  *  Maps to one element of SDK_CONTRACT.md `bot_pose.bones[]`:
- *    bones[i].name -> Name      (SMPL-X canonical bone name; one of the 52 names)
+ *    bones[i].name -> Name      (MHR wire bone name; one of the 63 names)
  *    bones[i].quat -> Quat      (FVector4 carrying [x, y, z, w] float32 quaternion)
  *
  *  Identity quaternion default (0,0,0,1) so an absent / malformed entry parses
- *  to a no-rotation bone rather than crashing the renderer. */
+ *  to a benign value rather than crashing the renderer. NOTE: on the MHR rig
+ *  identity != rest — the rest pose is MHR's A-pose local frames. */
 USTRUCT(BlueprintType)
 struct ESTUARY_API FEstuaryBotPoseBone
 {
     GENERATED_BODY()
 
-    /** SMPL-X canonical bone name. One of the 52 canonical names: 22 body
-     *  (hips, leftUpperLeg, ..., rightHand) + 30 finger
-     *  (leftIndex1..leftThumb3, rightIndex1..rightThumb3). Wire key: bones[i].name. */
+    /** MHR wire bone name. One of the 63 canonical names in wire order
+     *  (root, l_upleg, ..., c_head — authority: generated EstuaryMHRRig.h).
+     *  Wire name == SK_GestureSyncSource skeleton bone name (generated FBX),
+     *  so no client-side name remap exists. Wire key: bones[i].name. */
     UPROPERTY(BlueprintReadWrite, Category="Estuary|BodyAnimation",
               meta=(DisplayName="Name",
-                    ToolTip="SMPL-X canonical bone name (one of the 52 names enumerated in SDK_CONTRACT body_animation_stream)."))
+                    ToolTip="MHR wire bone name (one of the 63 names enumerated in SDK_CONTRACT body_animation_stream)."))
     FString Name;
 
     /** Quaternion as FVector4 with components ordered [x, y, z, w] (float32).
-     *  Default is the identity quaternion (0,0,0,1).
+     *  LOCAL joint rotation in the MHR canonical frame (RH, +Y up, +Z forward);
+     *  w >= 0 per frame with per-bone cross-chunk sign-linking server-side.
+     *  Default is the identity quaternion (0,0,0,1) — NOT the rest pose.
      *  Wire key: bones[i].quat (4-element array). */
     UPROPERTY(BlueprintReadWrite, Category="Estuary|BodyAnimation",
               meta=(DisplayName="Quat (xyzw)",
-                    ToolTip="Local-space rotation as a quaternion [x, y, z, w]. Identity default = (0,0,0,1)."))
+                    ToolTip="LOCAL rotation quaternion [x, y, z, w] in the MHR canonical frame. Identity default = (0,0,0,1); identity != rest on the MHR rig."))
     FVector4 Quat = FVector4(0.0, 0.0, 0.0, 1.0);
 };
 
@@ -978,16 +1065,15 @@ struct ESTUARY_API FEstuaryBotPoseBone
  *    message_id          -> MessageId          (utterance UUID)
  *    sequence            -> FrameIndex         (0-based; -1 on terminator)
  *    time_code_sec       -> TimeCodeSec        (seconds from utterance start)
- *    fps                 -> Fps                (always 30 for v2.0)
- *    bones               -> Bones              (52 SMPL-X canonical bones; 22 body + 30 finger)
- *    hips_world          -> HipsWorld          (SMPL-X canonical meters)
- *    hips_local_to_floor -> HipsLocalToFloor   (SMPL-X canonical meters)
+ *    fps                 -> Fps                (always 30)
+ *    bones               -> Bones              (63 MHR wire bones, LOCAL quats xyzw)
+ *    hips_world          -> HipsWorld          (root-position delta, meters, agent frame)
  *    emit_epoch_ms       -> EmitEpochMs        (worker wall-clock; diagnostics only)
  *    is_final            -> bIsFinal           (true only on terminator frame)
  *
- *  Hips translation values are SMPL-X canonical meters — they MUST be converted
- *  before driving an Unreal Skeletal Mesh (× 100 m→cm, axis flips). The first-pass
- *  receiver scaffold does NOT apply this conversion; that lives in Phase 4 UE-05.
+ *  HipsWorld is a pelvis-centred root delta in MHR canonical meters (Y
+ *  oscillates ~0) — converted for UE by EstuaryBodyFrameTransform::ToUEHipsFromMHR
+ *  in the body receiver before driving a Skeletal Mesh.
  */
 USTRUCT(BlueprintType)
 struct ESTUARY_API FEstuaryBotPose
@@ -1028,37 +1114,28 @@ struct ESTUARY_API FEstuaryBotPose
     int32 Fps = 30;
 
     /**
-     * 52 canonical SMPL-X bones (wire order matches GestureSync server CANONICAL_52_BONE_NAMES =
-     * 22 body + 30 finger; body 0..21 byte-identical to the legacy v10 22-bone wire order
-     * per the stable-prefix invariant). Empty array on the terminator frame
-     * (FrameIndex == -1 / bIsFinal == true). Each entry carries a bone name and an
-     * [x, y, z, w] quaternion. Consumers MUST iterate Bones.Num() rather than assuming
-     * a fixed count — Phase 3.5 WIRE-09.
+     * Exactly 63 MHR wire bones in the canonical wire order (authority: SARAH
+     * models/rig.py via the generated EstuaryMHRRig.h — root, l_upleg, ...,
+     * c_head). Empty array on the terminator frame (FrameIndex == -1 /
+     * bIsFinal == true). Each entry carries a bone name and a LOCAL-rotation
+     * [x, y, z, w] quaternion. The body receiver DROPS any non-terminator
+     * frame whose count != 63 with a throttled Error (no legacy tolerance).
      */
     UPROPERTY(BlueprintReadWrite, Category="Estuary|BodyAnimation",
               meta=(DisplayName="Bones",
-                    ToolTip="52 SMPL-X canonical bone rotations (wire order matches CANONICAL_52_BONE_NAMES — 22 body + 30 finger)."))
+                    ToolTip="63 MHR wire-bone LOCAL rotations (MHR63 canonical wire order — see SDK_CONTRACT body_animation_stream)."))
     TArray<FEstuaryBotPoseBone> Bones;
 
     /**
-     * Hips world-space translation in SMPL-X canonical meters (FVector x, y, z).
-     * MUST be converted (× 100 m→cm + axis flips) before driving an Unreal mesh.
+     * Root-position delta in MHR canonical meters, agent frame (pelvis-centred;
+     * Y oscillates ~0). Converted for UE by
+     * EstuaryBodyFrameTransform::ToUEHipsFromMHR before driving a mesh.
      * Wire key: "hips_world" (3-element array of numbers).
      */
     UPROPERTY(BlueprintReadWrite, Category="Estuary|BodyAnimation",
               meta=(DisplayName="Hips World",
-                    ToolTip="Hips world-space translation in SMPL-X canonical meters. Convert via Phase 4 UE-05 (× 100 m→cm + axis flips) before applying."))
+                    ToolTip="Root-position delta in MHR canonical meters (agent frame, pelvis-centred). Converted via EstuaryBodyFrameTransform::ToUEHipsFromMHR."))
     FVector HipsWorld = FVector::ZeroVector;
-
-    /**
-     * Hips local-to-floor translation in SMPL-X canonical meters (FVector x, y, z).
-     * Conversion to UE units / axes deferred to Phase 4 UE-05.
-     * Wire key: "hips_local_to_floor" (3-element array of numbers).
-     */
-    UPROPERTY(BlueprintReadWrite, Category="Estuary|BodyAnimation",
-              meta=(DisplayName="Hips Local To Floor",
-                    ToolTip="Hips translation relative to the floor plane in SMPL-X canonical meters. Conversion to UE units deferred to Phase 4 UE-05."))
-    FVector HipsLocalToFloor = FVector::ZeroVector;
 
     /**
      * Wall-clock millis at worker emit time — useful for RTT/drift diagnostics.

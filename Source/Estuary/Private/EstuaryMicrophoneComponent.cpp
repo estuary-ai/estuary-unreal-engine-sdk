@@ -277,22 +277,7 @@ void UEstuaryMicrophoneComponent::StopListening()
 
     if (!bIsCapturing) { return; }
 
-#if WITH_ESTUARY_RAI
-    // Stop capture and clear callback before any further ticks can enqueue.
-    if (UCapturableSoundWave* TypedWave = Cast<UCapturableSoundWave>(CapturableWave.Get()))
-    {
-        TypedWave->StopCapture();
-        TypedWave->OnAudioChunkReceived = nullptr;
-    }
-#else
-    // Built-in path — stop and close the FAudioCapture stream.
-    if (BuiltInCapture.IsValid())
-    {
-        BuiltInCapture->Capture.StopStream();
-        BuiltInCapture->Capture.CloseStream();
-        BuiltInCapture.Reset();
-    }
-#endif
+    StopCaptureDevice();
 
     // Drain any remaining queued audio before emitting stop_voice.
     if (UEstuarySubsystem* Subsystem = WeakSubsystem.Get())
@@ -319,6 +304,55 @@ void UEstuaryMicrophoneComponent::StopListening()
 
     bIsCapturing = false;
     UE_LOG(LogEstuary, Log, TEXT("[EstuaryMicrophoneComponent] capture stopped"));
+}
+
+// ============================================================================
+// StopCaptureLocal — local release, NO server emits
+// ============================================================================
+
+void UEstuaryMicrophoneComponent::StopCaptureLocal()
+{
+    check(IsInGameThread());
+
+    if (!bIsCapturing) { return; }
+
+    StopCaptureDevice();
+
+    // Discard queued audio — the server-side voice session is already gone
+    // (voice_timeout / session_timeout / disconnect); do NOT stream_audio into
+    // a closed STT stream and do NOT emit stop_voice for it.
+    TArray<uint8> Discard;
+    while (AudioQueue.Dequeue(Discard)) {}
+
+    bIsCapturing = false;
+    UE_LOG(LogEstuary, Log,
+        TEXT("[EstuaryMicrophoneComponent] capture stopped locally (server already released voice — no stop_voice emitted)"));
+}
+
+// ============================================================================
+// StopCaptureDevice — shared platform capture teardown
+// ============================================================================
+
+void UEstuaryMicrophoneComponent::StopCaptureDevice()
+{
+    check(IsInGameThread());
+
+#if WITH_ESTUARY_RAI
+    // Stop capture and clear callback before any further ticks can enqueue.
+    if (UCapturableSoundWave* TypedWave = Cast<UCapturableSoundWave>(CapturableWave.Get()))
+    {
+        TypedWave->StopCapture();
+        TypedWave->OnAudioChunkReceived = nullptr;
+    }
+#else
+    // Built-in path — stop and close the FAudioCapture stream.
+    if (BuiltInCapture.IsValid())
+    {
+        BuiltInCapture->Capture.StopStream();
+        BuiltInCapture->Capture.CloseStream();
+        BuiltInCapture.Reset();
+    }
+#endif
 }
 
 // ============================================================================

@@ -22,11 +22,13 @@
 #include "EstuaryDeveloperSettings.h"
 #include "EstuaryLog.h"
 #include "EstuaryMarshal.h"
+#include "EstuaryMicrophoneComponent.h"
+#include "EstuaryAudioPlayerComponent.h"
 
 #include "Containers/Ticker.h"
 #include "Containers/Map.h"
-#include "Dom/JsonObject.h"
 #include "Engine/GameInstance.h"
+#include "GameFramework/Actor.h"
 #include "Math/UnrealMathUtility.h"
 
 // ============================================================================
@@ -78,6 +80,9 @@ void UEstuarySubsystem::Deinitialize()
         Bridge->OnLiveKitTokenSink   = nullptr;
         Bridge->OnLiveKitReadySink   = nullptr;
         Bridge->OnLiveKitErrorSink   = nullptr;
+        // Idle-reaper sinks.
+        Bridge->OnSessionTimeoutSink = nullptr;
+        Bridge->OnVoiceTimeoutSink   = nullptr;
 
         Bridge->Disconnect();
         Bridge.Reset();
@@ -150,13 +155,26 @@ void UEstuarySubsystem::Connect(const FString& ServerUrl, const FEstuaryAuthPayl
     CachedServerUrl     = ServerUrl;
     CachedAuth          = NormalizedAuth;
     ReconnectAttempts   = 0;
+    // Explicit Connect() = user intent: clear the session_timeout reconnect
+    // suppression so a deliberate resume after an idle reap works. This is the
+    // ONLY place the flag is cleared (never on the reap's own transport close).
+    bServerEndedSession = false;
+    bVoiceSuspended = false;
     CancelReconnect();
 
     if (!Bridge.IsValid())
     {
         Bridge = MakeShared<FEstuarySocketIOBridge>();
-        BindBridgeSinks();
     }
+
+    // ALWAYS rebind — not just on bridge creation. FEstuarySocketIOBridge::
+    // Disconnect() nulls every outbound sink (belt-and-suspenders against late
+    // marshaled dispatches), and both HandleSessionTimeout and HandleAuthError
+    // call it before a later user-initiated Connect() reuses this bridge.
+    // Without the rebind, the reconnect authenticates fine but session_info
+    // lands in a null sink and the client hangs in Connecting (found live
+    // 2026-07-09 on the explicit-resume-after-reap path).
+    BindBridgeSinks();
 
     SetState(EEstuarySessionState::Connecting);
     Bridge->Connect(ServerUrl, CachedAuth);
@@ -220,6 +238,16 @@ void UEstuarySubsystem::BindBridgeSinks()
     Bridge->OnMemoryUpdated = [WeakThis](const FEstuaryMemoryUpdated& Memory)
     {
         if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleMemoryUpdated(Memory); }
+    };
+
+    Bridge->OnSessionTimeoutSink = [WeakThis](const FEstuarySessionTimeout& Timeout)
+    {
+        if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleSessionTimeout(Timeout); }
+    };
+
+    Bridge->OnVoiceTimeoutSink = [WeakThis](const FEstuaryVoiceTimeout& Timeout)
+    {
+        if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleVoiceTimeout(Timeout); }
     };
 
     Bridge->OnTransportConnected = [WeakThis]()
@@ -469,6 +497,150 @@ void UEstuarySubsystem::HandleMemoryUpdated(const FEstuaryMemoryUpdated& Memory)
     OnMemoryUpdated.Broadcast(Memory);
 }
 
+void UEstuarySubsystem::HandleSessionTimeout(const FEstuarySessionTimeout& Timeout)
+{
+    check(IsInGameThread());
+
+    UE_LOG(LogEstuary, Warning,
+        TEXT("[Subsystem] session_timeout: reason=%s idle=%ds timeout=%ds — server reaped the session; auto-reconnect suppressed"),
+        *Timeout.Reason, Timeout.IdleSeconds, Timeout.TimeoutSeconds);
+
+    // Suppress the auto-reconnect for the server-initiated disconnect that
+    // immediately follows. Reconnecting would re-auth and re-establish billed
+    // voice resources (LiveKit pre-join, Deepgram) with nobody talking, in a
+    // loop (SDK_CONTRACT §session_timeout). Cleared only by explicit Connect().
+    bServerEndedSession = true;
+
+    // Race guard: this event and the transport close are marshaled to the game
+    // thread independently — the close can land FIRST and already have scheduled
+    // a backoff reconnect. Cancel it and settle in Disconnected.
+    if (SessionState == EEstuarySessionState::Reconnecting)
+    {
+        UE_LOG(LogEstuary, Log,
+            TEXT("[Subsystem] session_timeout arrived after the transport close — cancelling the scheduled reconnect"));
+        CancelReconnect();
+        SetState(EEstuarySessionState::Disconnected);
+    }
+
+    // Release local voice state now (mic off, LiveKit room disposed client-side —
+    // the server has already deleted it).
+    ReleaseVoiceResourcesLocal(TEXT("session_timeout"));
+
+    OnSessionTimeout.Broadcast(Timeout);
+
+    // Proactively tear the socket down — do NOT wait for a transport close.
+    // getnamo's OnDisconnectedCallback is TRANSPORT-level and does NOT fire when
+    // the server disconnects only the /sdk NAMESPACE (verified live 2026-07-09:
+    // after a gateway reap the Engine.IO connection lingered and the client sat
+    // "Connected" indefinitely — unlike the JS/Python socket.io clients, which
+    // surface per-namespace disconnects). Bridge->Disconnect() never fires
+    // OnTransportClosed, so this cannot cause a Reconnecting transition; the
+    // bServerEndedSession guards above remain for a real close racing in first.
+    if (Bridge.IsValid())
+    {
+        Bridge->Disconnect();
+    }
+    SetState(EEstuarySessionState::Disconnected);
+}
+
+void UEstuarySubsystem::HandleVoiceTimeout(const FEstuaryVoiceTimeout& Timeout)
+{
+    check(IsInGameThread());
+
+    UE_LOG(LogEstuary, Warning,
+        TEXT("[Subsystem] voice_timeout: reason=%s idle=%ds timeout=%ds — releasing local voice; socket stays connected"),
+        *Timeout.Reason, Timeout.IdleSeconds, Timeout.TimeoutSeconds);
+
+    // Voice lane only: STT closed and LiveKit room deleted server-side, but the
+    // Socket.IO session is alive and text chat continues. Deliberately does NOT
+    // touch bServerEndedSession — no disconnect follows (opposite of
+    // session_timeout; SDK_CONTRACT §voice_timeout Ordering).
+    ReleaseVoiceResourcesLocal(TEXT("voice_timeout"));
+
+    bVoiceSuspended = true; // cleared on livekit_ready (re-establishment) or Connect()
+
+    // Recommended app UX (auto-mute illusion): keep the call UI open, show the
+    // mic as muted, and StartListening() again when the user unmutes — that
+    // starts a FRESH voice session against the server.
+    OnVoiceTimeout.Broadcast(Timeout);
+}
+
+void UEstuarySubsystem::ReleaseVoiceResourcesLocal(const TCHAR* Context)
+{
+    check(IsInGameThread());
+
+    bool bReleasedAny = false;
+
+    // Stop mic capture WITHOUT emitting stop_voice — the server-side voice
+    // session is already gone; streaming into a closed STT stream (or emitting
+    // stop_voice for it) is the stale-voice-state bug class that bit the TS,
+    // Python, and Lens SDKs. Sweep every registered character's sibling mic
+    // component: StopCaptureLocal() is an idempotent no-op when not capturing.
+    for (auto& Pair : RegisteredCharacters)
+    {
+        UEstuaryCharacterComponent* Comp = Pair.Value.Get();
+        if (!Comp) { continue; }
+
+        AActor* Owner = Comp->GetOwner();
+        if (!Owner) { continue; }
+
+        if (UEstuaryMicrophoneComponent* Mic = Owner->FindComponentByClass<UEstuaryMicrophoneComponent>())
+        {
+            if (Mic->bIsCapturing)
+            {
+                Mic->StopCaptureLocal();
+                bReleasedAny = true;
+            }
+        }
+
+        // Clear playback message tracking too (stale-CurrentMessageId latch,
+        // found live 2026-07-09): in LiveKit mode EnqueueBotVoice tracks the
+        // message id but skips PCM, so nothing ever drains and the id never
+        // resets — after the transition to WebSocket voice every new
+        // bot_voice message mismatches the latched id and ALL audio is
+        // silently dropped as "stale". An interrupt for a different id
+        // cannot clear it (the mismatch guard is intentional, T-04-03-01).
+        // Unconditional flush on release resets the latch; audio for any
+        // in-flight message is already moot — its transport just died.
+        if (UEstuaryAudioPlayerComponent* Player = Owner->FindComponentByClass<UEstuaryAudioPlayerComponent>())
+        {
+            Player->FlushAllForMessage(FString());
+            bReleasedAny = true;
+        }
+    }
+
+    // Dispose the LiveKit room client-side WITHOUT emitting livekit_leave — the
+    // room is already deleted server-side, and the TS SDK's releaseVoice()
+    // (canonical mirror) emits nothing either. The room's own Disconnected event
+    // during this teardown is EXPECTED and not a call failure.
+    // CurrentVoiceMode reverts to WebSocket in OnLiveKitVoiceLeft.
+    if (CurrentVoiceMode == EEstuaryVoiceMode::LiveKit &&
+        LiveKitBridge.IsAvailable() && LiveKitBridge.GetVoice() &&
+        LiveKitBridge.GetVoice()->IsJoined())
+    {
+        LiveKitBridge.GetVoice()->LeaveRoom();
+        bReleasedAny = true;
+    }
+
+    if (!ActiveVoiceCharacterId.IsEmpty())
+    {
+        ActiveVoiceCharacterId.Empty();
+        bReleasedAny = true;
+    }
+
+    if (bReleasedAny)
+    {
+        UE_LOG(LogEstuary, Log,
+            TEXT("[Subsystem] ReleaseVoiceResourcesLocal (%s): local voice state released — no server emits"),
+            Context);
+    }
+    else
+    {
+        UE_LOG(LogEstuary, Verbose,
+            TEXT("[Subsystem] ReleaseVoiceResourcesLocal (%s): nothing to release"), Context);
+    }
+}
+
 void UEstuarySubsystem::HandleTransportConnected()
 {
     check(IsInGameThread());
@@ -484,6 +656,27 @@ void UEstuarySubsystem::HandleTransportClosed(int32 CloseCode, const FString& Re
 
     UE_LOG(LogEstuary, Log,
         TEXT("[Subsystem] transport closed code=%d reason=%s"), CloseCode, *Reason);
+
+    // ANY transport close of a voice-active session leaves stale local voice
+    // state: the server deletes the LiveKit room on ANY disconnect (SDK_CONTRACT
+    // §session_timeout Related behavior) and the STT stream dies with the socket.
+    // Release locally (no server emits) so the mic is not left hot and the next
+    // voice start after a reconnect starts a FRESH session instead of streaming
+    // into a closed stream. Idempotent — no-op when voice was never active.
+    ReleaseVoiceResourcesLocal(TEXT("transport closed"));
+
+    // Server-initiated idle reap (session_timeout was received just before this
+    // close): do NOT auto-reconnect. Re-authenticating would re-establish billed
+    // voice resources with nobody talking, in a loop. Explicit Connect() (user
+    // intent) is the only resume path — it clears bServerEndedSession.
+    if (bServerEndedSession)
+    {
+        UE_LOG(LogEstuary, Log,
+            TEXT("[Subsystem] transport closed after session_timeout — auto-reconnect suppressed (explicit Connect() required)"));
+        CancelReconnect();
+        SetState(EEstuarySessionState::Disconnected);
+        return;
+    }
 
     // 1000 = clean intentional close (Disconnect() was called) or we're already in
     // an Error state (auth_error / session_rejected path already handled cleanup).
@@ -577,6 +770,17 @@ bool UEstuarySubsystem::TickReconnect(float /*DeltaTime*/)
     ReconnectHandle.Reset();  // one-shot; clear the handle before any early-out
     check(IsInGameThread());
 
+    // Belt-and-braces for the session_timeout race: if the reap event was
+    // processed AFTER the transport close scheduled this ticker, the flag is set
+    // now — abort instead of re-establishing a billed session in a loop.
+    if (bServerEndedSession)
+    {
+        UE_LOG(LogEstuary, Log,
+            TEXT("[Subsystem] TickReconnect: server ended the session (session_timeout) — aborting scheduled reconnect"));
+        SetState(EEstuarySessionState::Disconnected);
+        return false;
+    }
+
     // Guard: state may have changed since the ticker was scheduled
     // (e.g., consumer called Disconnect() while backoff was pending).
     if (SessionState != EEstuarySessionState::Reconnecting)
@@ -616,6 +820,9 @@ bool UEstuarySubsystem::TickReconnect(float /*DeltaTime*/)
         Bridge->OnLiveKitTokenSink   = nullptr;
         Bridge->OnLiveKitReadySink   = nullptr;
         Bridge->OnLiveKitErrorSink   = nullptr;
+        // Idle-reaper sinks.
+        Bridge->OnSessionTimeoutSink = nullptr;
+        Bridge->OnVoiceTimeoutSink   = nullptr;
         Bridge->Disconnect();
     }
 
@@ -891,6 +1098,22 @@ void UEstuarySubsystem::StartVoiceSession(const FString& CharacterId)
     Bridge->EmitStartVoice();
     UE_LOG(LogEstuary, Log,
         TEXT("[Subsystem] StartVoiceSession: start_voice emitted (char='%s')"), *CharacterId);
+
+    // Voice start = voice intent: (re)join LiveKit when it is available but not
+    // active. Two reasons (SDK_CONTRACT §voice_livekit / §voice_timeout):
+    //  1. Warm start — the gateway allocates voice resources lazily on the
+    //     livekit_token request, so emitting it here pre-warms the bot join.
+    //  2. Auto-mute resume parity — after a voice_timeout released the room,
+    //     the next voice start must transparently begin a FRESH LiveKit session
+    //     (livekit_token → livekit_join) instead of silently degrading to
+    //     WebSocket voice (no AEC, PTT/Flux end-of-turn race). Matches the TS
+    //     SDK's unmute behavior. RequestLiveKitToken self-guards: no-op when
+    //     LiveKit is disabled, unavailable, or already joined; WebSocket voice
+    //     keeps flowing until the room takes over.
+    if (CurrentVoiceMode == EEstuaryVoiceMode::WebSocket)
+    {
+        RequestLiveKitToken();
+    }
 }
 
 void UEstuarySubsystem::StopVoiceSession(const FString& CharacterId)
@@ -970,25 +1193,6 @@ void UEstuarySubsystem::EmitCameraImage(const FEstuaryCameraImage& Payload)
     }
 
     Bridge->EmitCameraImage(Payload);
-}
-
-// ============================================================================
-// EmitBindPose (per-character bind-pose handshake)
-// SDK_CONTRACT §bind_pose — REQUIRED-FOR-BODY
-// ============================================================================
-
-void UEstuarySubsystem::EmitBindPose(const TSharedRef<FJsonObject>& Payload)
-{
-    check(IsInGameThread());
-
-    if (!Bridge.IsValid() || !Bridge->IsConnected())
-    {
-        UE_LOG(LogEstuary, Warning,
-            TEXT("[Subsystem] EmitBindPose: not connected — drop (bind_pose will not reach server)"));
-        return;
-    }
-
-    Bridge->EmitBindPose(Payload);
 }
 
 // ============================================================================
@@ -1336,6 +1540,9 @@ void UEstuarySubsystem::HandleLiveKitReady(const FString& Room)
     // would re-trigger the server's join flow.
     UE_LOG(LogEstuary, Log,
         TEXT("[Subsystem] livekit_ready — room=%s (server bot pipeline active)"), *Room);
+
+    bVoiceSuspended = false;
+    OnVoiceReady.Broadcast(Room);
 }
 
 void UEstuarySubsystem::HandleLiveKitError(const FString& Error)
@@ -1392,6 +1599,15 @@ void UEstuarySubsystem::OnLiveKitVoiceLeft()
         LiveKitBridge.GetVoice()->OnLeft.RemoveAll(this);
         LiveKitBridge.GetVoice()->OnConnectionError.RemoveAll(this);
     }
+
+    // Belt-and-braces (stale-voice-state bug class): the room can disconnect
+    // server-side WITHOUT a preceding client action or voice_timeout event
+    // (e.g. the reaper deleted it, or the network dropped WebRTC). If the mic
+    // is still capturing at that point it would keep pushing into a dead room
+    // — or, after the mode revert above, start streaming stream_audio into a
+    // session that never sent start_voice. Release local voice state; no-op on
+    // the normal paths where it was already released.
+    ReleaseVoiceResourcesLocal(TEXT("livekit room left"));
 }
 
 void UEstuarySubsystem::OnLiveKitVoiceError(const FString& ErrorMessage)
@@ -1410,4 +1626,8 @@ void UEstuarySubsystem::OnLiveKitVoiceError(const FString& ErrorMessage)
         LiveKitBridge.GetVoice()->OnLeft.RemoveAll(this);
         LiveKitBridge.GetVoice()->OnConnectionError.RemoveAll(this);
     }
+
+    // Same stale-voice-state cleanup as OnLiveKitVoiceLeft — a connection error
+    // mid-call must not leave a hot mic pushing into a dead room.
+    ReleaseVoiceResourcesLocal(TEXT("livekit voice error"));
 }

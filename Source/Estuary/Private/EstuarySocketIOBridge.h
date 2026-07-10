@@ -118,6 +118,17 @@ public:
      *  after a conversation ends. NewMemories items use camelCase wire keys. */
     TFunction<void(const FEstuaryMemoryUpdated&)>           OnMemoryUpdated;
 
+    /** Fired when `session_timeout` is received — server idle reap. The gateway
+     *  disconnects the socket immediately after; the subsystem must suppress its
+     *  auto-reconnect for that close (SDK_CONTRACT §session_timeout). */
+    TFunction<void(const FEstuarySessionTimeout&)>          OnSessionTimeoutSink;
+
+    /** Fired when `voice_timeout` is received — voice-lane idle release. The
+     *  socket STAYS CONNECTED (no disconnect follows — opposite of
+     *  session_timeout). The subsystem releases local voice resources only
+     *  (SDK_CONTRACT §voice_timeout). */
+    TFunction<void(const FEstuaryVoiceTimeout&)>            OnVoiceTimeoutSink;
+
     // -----------------------------------------------------------------------
     // Text-chat inbound sinks (Plan 03-02).
     // -----------------------------------------------------------------------
@@ -179,13 +190,6 @@ public:
      *  "text" (omitted if empty), "sample_rate" (omitted if 0).
      *  Called by UEstuaryCameraComponent after background JPEG encode completes. */
     void EmitCameraImage(const FEstuaryCameraImage& Payload);
-
-    /** Emit `bind_pose` on /sdk with the pre-built JSON payload.
-     *  Optional per-character bind-pose handshake — the body receiver currently
-     *  relies on the server's identity-bind fallback and does not emit one.
-     *  Payload = TSharedRef<FJsonObject> with a single "bones" object field.
-     *  Requires "Dom/JsonObject.h" in the including .cpp (already included there). */
-    void EmitBindPose(const TSharedRef<FJsonObject>& Payload);
 
     /** Emit `user_pos` on /sdk with the floor-projected user head xy.
      *  GestureSync dyadic conditioning (paper p_y) — required for spatially-aware

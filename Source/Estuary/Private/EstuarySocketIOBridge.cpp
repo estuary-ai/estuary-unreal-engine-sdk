@@ -64,6 +64,8 @@ static const TSet<FString> KnownCameraCaptureFields  = { TEXT("request_id"), TEX
 static const TSet<FString> KnownErrorFields          = { TEXT("message") };
 static const TSet<FString> KnownQuotaExceededFields  = { TEXT("error"), TEXT("message"), TEXT("current"), TEXT("limit"), TEXT("remaining"), TEXT("tier") };
 static const TSet<FString> KnownMemoryUpdatedFields  = { TEXT("agent_id"), TEXT("player_id"), TEXT("memories_extracted"), TEXT("facts_extracted"), TEXT("conversation_id"), TEXT("new_memories"), TEXT("timestamp") };
+static const TSet<FString> KnownSessionTimeoutFields = { TEXT("reason"), TEXT("idle_seconds"), TEXT("timeout_seconds") };
+static const TSet<FString> KnownVoiceTimeoutFields   = { TEXT("reason"), TEXT("idle_seconds"), TEXT("timeout_seconds") };
 // MemoryData items use camelCase keys (Memory.to_dict()); sourceMessageTimestamp is
 // emitted by the live server but absent from SDK_CONTRACT.md — kept here so the
 // per-item schema-drift warning does not fire on it.
@@ -172,6 +174,8 @@ void FEstuarySocketIOBridge::Disconnect()
     OnLiveKitTokenSink   = nullptr;
     OnLiveKitReadySink   = nullptr;
     OnLiveKitErrorSink   = nullptr;
+    OnSessionTimeoutSink = nullptr;
+    OnVoiceTimeoutSink   = nullptr;
     // Do NOT fire OnTransportClosed here — the subsystem initiated the disconnect
     // and already knows about it. Firing would cause a spurious Reconnecting transition.
 }
@@ -389,7 +393,9 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
 
                 // animation_capabilities (optional; older servers omit it).
                 // SDK_CONTRACT §session_info.animation_capabilities —
-                // { face: {active, provider}, body: {active, provider} }.
+                // { face: {active, provider}, body: {active, provider, rig} }.
+                // body.rig identifies the wire rig ("mhr63"); the body receiver
+                // hard-checks it and disables itself loudly on mismatch.
                 // Unknown future modalities (e.g. gaze) are tolerated and ignored.
                 const TSharedPtr<FJsonObject>* CapsObj = nullptr;
                 if (JsonObj->TryGetObjectField(TEXT("animation_capabilities"), CapsObj)
@@ -407,18 +413,20 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     {
                         (*BodyObj)->TryGetBoolField(TEXT("active"),     Out.AnimationCapabilities.Body.bActive);
                         (*BodyObj)->TryGetStringField(TEXT("provider"), Out.AnimationCapabilities.Body.Provider);
+                        (*BodyObj)->TryGetStringField(TEXT("rig"),      Out.AnimationCapabilities.Body.Rig);
                     }
                 }
 
                 UE_LOG(LogEstuary, Verbose,
-                    TEXT("[Bridge] session_info parsed: session=%s conv=%s body_active=%d face_active=%d"),
+                    TEXT("[Bridge] session_info parsed: session=%s conv=%s body_active=%d body_rig=%s face_active=%d"),
                     *Out.SessionId, *Out.ConversationId,
                     Out.AnimationCapabilities.Body.bActive ? 1 : 0,
+                    Out.AnimationCapabilities.Body.Rig.IsEmpty() ? TEXT("<none>") : *Out.AnimationCapabilities.Body.Rig,
                     Out.AnimationCapabilities.Face.bActive ? 1 : 0);
 
                 // Warn once per unknown field (Pitfall 19 schema-drift guard).
                 TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                for (const auto& Field : JsonObj->Values)
+                for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                 {
                     if (!KnownSessionInfoFields.Contains(Field.Key))
                     {
@@ -472,7 +480,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     JsonObj->TryGetStringField(TEXT("error"), Out.Error);
 
                     TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                    for (const auto& Field : JsonObj->Values)
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                     {
                         if (!KnownAuthErrorFields.Contains(Field.Key))
                         {
@@ -536,7 +544,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     }
 
                     TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                    for (const auto& Field : JsonObj->Values)
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                     {
                         if (!KnownSessionRejectedFields.Contains(Field.Key))
                         {
@@ -594,7 +602,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     JsonObj->TryGetStringField(TEXT("message"), Out.Message);
 
                     TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                    for (const auto& Field : JsonObj->Values)
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                     {
                         if (!KnownErrorFields.Contains(Field.Key))
                         {
@@ -663,7 +671,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     if (JsonObj->TryGetNumberField(TEXT("remaining"), IntVal)) { Out.Remaining = IntVal; }
 
                     TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                    for (const auto& Field : JsonObj->Values)
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                     {
                         if (!KnownQuotaExceededFields.Contains(Field.Key))
                         {
@@ -788,7 +796,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
 
                             // Per-item schema-drift warning (Pitfall 19) on the camelCase keys.
                             TWeakPtr<FEstuarySocketIOBridge> WeakSelfItem = WeakSelf;
-                            for (const auto& Field : MemObj->Values)
+                            for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : MemObj->Values)
                             {
                                 if (!KnownMemoryDataFields.Contains(Field.Key))
                                 {
@@ -813,7 +821,7 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
 
                     // Top-level schema-drift warning.
                     TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
-                    for (const auto& Field : JsonObj->Values)
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
                     {
                         if (!KnownMemoryUpdatedFields.Contains(Field.Key))
                         {
@@ -1295,12 +1303,11 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
             TEXT("/sdk"));
     }
 
-    // bot_pose — GestureSync-driven body-animation frames at 30 fps (Phase 4 — body_animation_stream).
-    // 52 SMPL-X canonical bones per frame (22 body + 30 finger; quaternions [x,y,z,w])
-    // plus hips translation; sequence==-1 / bones==[] / is_final==true marks the
-    // terminator (filtered by subsystem). Phase 3.5 WIRE-09: parse loop iterates
-    // BonesArr->Num() — never assumes a fixed count, so the same code worked before
-    // and after the v10→v11 hard-cut.
+    // bot_pose — GestureSync-driven body-animation frames at 30 fps (body_animation_stream).
+    // 63 MHR wire bones per frame (LOCAL quaternions [x,y,z,w] in the MHR canonical
+    // frame) plus the root-position delta; sequence==-1 / bones==[] / is_final==true
+    // marks the terminator (filtered by subsystem). The parse loop iterates
+    // BonesArr->Num(); the receiver enforces the ==63 count gate at ingest.
     {
         TWeakPtr<FEstuarySocketIOBridge, ESPMode::ThreadSafe> WeakSelf = AsWeak();
         Impl->Socket->OnEvent(
@@ -1334,7 +1341,6 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                 //   fps                 -> Fps          (default 30)
                 //   bones               -> Bones        (array of {name, quat:[x,y,z,w]})
                 //   hips_world          -> HipsWorld    (3-element array of numbers)
-                //   hips_local_to_floor -> HipsLocalToFloor (3-element array of numbers)
                 //   emit_epoch_ms       -> EmitEpochMs
                 //   is_final            -> bIsFinal
                 Obj->TryGetStringField(TEXT("message_id"), Parsed.MessageId);
@@ -1425,20 +1431,6 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                         (*HipsWorldArr)[1]->TryGetNumber(Hy);
                         (*HipsWorldArr)[2]->TryGetNumber(Hz);
                         Parsed.HipsWorld = FVector(Hx, Hy, Hz);
-                    }
-                }
-
-                // Parse hips_local_to_floor (3-element array of numbers).
-                {
-                    const TArray<TSharedPtr<FJsonValue>>* HipsFloorArr = nullptr;
-                    if (Obj->TryGetArrayField(TEXT("hips_local_to_floor"), HipsFloorArr)
-                        && HipsFloorArr && HipsFloorArr->Num() >= 3)
-                    {
-                        double Hx = 0.0, Hy = 0.0, Hz = 0.0;
-                        (*HipsFloorArr)[0]->TryGetNumber(Hx);
-                        (*HipsFloorArr)[1]->TryGetNumber(Hy);
-                        (*HipsFloorArr)[2]->TryGetNumber(Hz);
-                        Parsed.HipsLocalToFloor = FVector(Hx, Hy, Hz);
                     }
                 }
 
@@ -1573,6 +1565,124 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                             Pinned->OnLiveKitErrorSink(ErrorMsg);
                         }
                     });
+            },
+            TEXT("/sdk"));
+    }
+
+    // session_timeout — server idle reap (SDK_CONTRACT §session_timeout).
+    // The gateway force-closes the socket IMMEDIATELY after this event; the
+    // subsystem uses this sink to suppress its auto-reconnect for that close
+    // (re-authenticating would re-establish billed voice resources in a loop).
+    {
+        TWeakPtr<FEstuarySocketIOBridge> WeakSelf = AsWeak();
+        Impl->Socket->OnEvent(
+            TEXT("session_timeout"),
+            [WeakSelf](const FString& EventName, const TSharedPtr<FJsonValue>& EventData)
+            {
+                FEstuarySessionTimeout Out;
+                TSharedPtr<FJsonObject> JsonObj;
+                if (EventData.IsValid() && EventData->Type == EJson::Object)
+                {
+                    JsonObj = EventData->AsObject();
+                }
+
+                if (JsonObj.IsValid())
+                {
+                    JsonObj->TryGetStringField(TEXT("reason"),          Out.Reason);
+                    JsonObj->TryGetNumberField(TEXT("idle_seconds"),    Out.IdleSeconds);
+                    JsonObj->TryGetNumberField(TEXT("timeout_seconds"), Out.TimeoutSeconds);
+
+                    TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
+                    {
+                        if (!KnownSessionTimeoutFields.Contains(Field.Key))
+                        {
+                            TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelfCopy.Pin();
+                            if (Self)
+                            {
+                                FScopeLock Lock(&Self->Impl->WarnedLock);
+                                FString CacheKey = FString::Printf(TEXT("session_timeout:%s"), *Field.Key);
+                                if (!Self->Impl->WarnedUnknownFields.Contains(CacheKey))
+                                {
+                                    Self->Impl->WarnedUnknownFields.Add(CacheKey);
+                                    UE_LOG(LogEstuary, Verbose,
+                                        TEXT("[Bridge] session_timeout: unknown field '%s' (schema drift?)"), *Field.Key);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                UE_LOG(LogEstuary, Warning,
+                    TEXT("[Bridge] session_timeout received: reason=%s idle=%ds timeout=%ds — server will disconnect"),
+                    *Out.Reason, Out.IdleSeconds, Out.TimeoutSeconds);
+
+                AsyncTask(ENamedThreads::GameThread, [WeakSelf, Out]()
+                {
+                    check(IsInGameThread());
+                    TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelf.Pin();
+                    if (!Self || Self->Impl->bShuttingDown) { return; }
+                    if (Self->OnSessionTimeoutSink) { Self->OnSessionTimeoutSink(Out); }
+                });
+            },
+            TEXT("/sdk"));
+    }
+
+    // voice_timeout — voice-lane idle release (SDK_CONTRACT §voice_timeout).
+    // Arrives on the STILL-OPEN socket; no disconnect follows (opposite of
+    // session_timeout — never wire this into reconnect suppression). The
+    // subsystem releases local voice resources only; text chat continues.
+    {
+        TWeakPtr<FEstuarySocketIOBridge> WeakSelf = AsWeak();
+        Impl->Socket->OnEvent(
+            TEXT("voice_timeout"),
+            [WeakSelf](const FString& EventName, const TSharedPtr<FJsonValue>& EventData)
+            {
+                FEstuaryVoiceTimeout Out;
+                TSharedPtr<FJsonObject> JsonObj;
+                if (EventData.IsValid() && EventData->Type == EJson::Object)
+                {
+                    JsonObj = EventData->AsObject();
+                }
+
+                if (JsonObj.IsValid())
+                {
+                    JsonObj->TryGetStringField(TEXT("reason"),          Out.Reason);
+                    JsonObj->TryGetNumberField(TEXT("idle_seconds"),    Out.IdleSeconds);
+                    JsonObj->TryGetNumberField(TEXT("timeout_seconds"), Out.TimeoutSeconds);
+
+                    TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
+                    {
+                        if (!KnownVoiceTimeoutFields.Contains(Field.Key))
+                        {
+                            TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelfCopy.Pin();
+                            if (Self)
+                            {
+                                FScopeLock Lock(&Self->Impl->WarnedLock);
+                                FString CacheKey = FString::Printf(TEXT("voice_timeout:%s"), *Field.Key);
+                                if (!Self->Impl->WarnedUnknownFields.Contains(CacheKey))
+                                {
+                                    Self->Impl->WarnedUnknownFields.Add(CacheKey);
+                                    UE_LOG(LogEstuary, Verbose,
+                                        TEXT("[Bridge] voice_timeout: unknown field '%s' (schema drift?)"), *Field.Key);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                UE_LOG(LogEstuary, Warning,
+                    TEXT("[Bridge] voice_timeout received: reason=%s idle=%ds timeout=%ds — socket stays connected"),
+                    *Out.Reason, Out.IdleSeconds, Out.TimeoutSeconds);
+
+                AsyncTask(ENamedThreads::GameThread, [WeakSelf, Out]()
+                {
+                    check(IsInGameThread());
+                    TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelf.Pin();
+                    if (!Self || Self->Impl->bShuttingDown) { return; }
+                    if (Self->OnVoiceTimeoutSink) { Self->OnVoiceTimeoutSink(Out); }
+                });
             },
             TEXT("/sdk"));
     }
@@ -1868,27 +1978,6 @@ void FEstuarySocketIOBridge::EmitCameraImage(const FEstuaryCameraImage& Payload)
 }
 
 // ============================================================================
-// EmitBindPose (per-character bind-pose handshake)
-// SDK_CONTRACT §bind_pose — REQUIRED-FOR-BODY: Client→Server, one-shot per session.
-// ============================================================================
-
-void FEstuarySocketIOBridge::EmitBindPose(const TSharedRef<FJsonObject>& Payload)
-{
-    check(IsInGameThread()); // Pitfall 1: emit must be on the game thread.
-
-    if (!Impl.IsValid() || !Impl->Socket.IsValid() || !Impl->Socket->bIsConnected)
-    {
-        UE_LOG(LogEstuary, Warning, TEXT("[Bridge] EmitBindPose: not connected — drop"));
-        return;
-    }
-
-    // Payload is the pre-built {bones: {<gestureSync_bone_name>: [qx,qy,qz,qw]}} object.
-    // Pass it directly — no extra wrapping needed.
-    UE_LOG(LogEstuary, Log, TEXT("[Bridge] EmitBindPose emitting bind_pose event"));
-    Impl->Socket->Emit(TEXT("bind_pose"), TSharedPtr<FJsonObject>(Payload), nullptr, TEXT("/sdk"));
-}
-
-// ============================================================================
 // EmitUserPos — GestureSync dyadic conditioning (paper p_y)
 // SDK_CONTRACT §user_pos — REQUIRED-FOR-BODY when GestureSync provider is active.
 // High-frequency event (~30 Hz); per-frame logging would dominate output.
@@ -2034,7 +2123,6 @@ void FEstuarySocketIOBridge::EmitAudioPlaybackComplete(const FEstuaryAudioPlayba
 void FEstuarySocketIOBridge::EmitStartVoice()                                                { WarnStubOnce(TEXT("EmitStartVoice")); }
 void FEstuarySocketIOBridge::EmitStreamAudio(const FEstuaryStreamAudio&)                     { WarnStubOnce(TEXT("EmitStreamAudio")); }
 void FEstuarySocketIOBridge::EmitStopVoice()                                                 { WarnStubOnce(TEXT("EmitStopVoice")); }
-void FEstuarySocketIOBridge::EmitBindPose(const TSharedRef<FJsonObject>&)                     { WarnStubOnce(TEXT("EmitBindPose")); }
 void FEstuarySocketIOBridge::EmitUserPos(float, float)                                        { WarnStubOnce(TEXT("EmitUserPos")); }
 void FEstuarySocketIOBridge::EmitCameraImage(const FEstuaryCameraImage&)                     { WarnStubOnce(TEXT("EmitCameraImage")); }
 void FEstuarySocketIOBridge::EmitLiveKitTokenRequest()                                       { WarnStubOnce(TEXT("EmitLiveKitTokenRequest")); }

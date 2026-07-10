@@ -331,20 +331,52 @@ void UEstuaryAudioPlayerComponent::EnqueueBotVoice(const FEstuaryBotVoice& Voice
     }
 
     // -----------------------------------------------------------------------
-    // EnableAnimation sample rate coercion (AUDIO-07, Pitfall 9).
-    // When lipsync is enabled the A2F gate requires exactly 16000 Hz.
+    // Wire-rate restore + EnableAnimation coercion (AUDIO-07, Pitfall 9).
+    //
+    // bot_voice PCM is generated at the session's negotiated audio_sample_rate
+    // (MakeDefaultAuthPayload sources it from UEstuaryDeveloperSettings::
+    // AudioSampleRate; EnableAnimation pins it to 16000 for the A2F gate).
+    // CurrentStreamSampleRate can legitimately DIFFER from that: a LiveKit call
+    // re-rates the procedural wave to the remote track rate (EnqueueRawPcm16
+    // probe, typically 48 kHz), and after the room is released (voice_timeout /
+    // leave / transport close) bot audio arrives HERE again — 16 kHz PCM played
+    // through a 48 kHz wave is 3x pitch ("squeaky bot" bug, found live
+    // 2026-07-09 right after the first voice_timeout release). Mirror the
+    // EnqueueRawPcm16 probe in reverse: drop any old-rate tail and reinitialise
+    // the wave at the wire rate before enqueuing.
+    // (Hand-built auth payloads with a rate different from project settings are
+    // not propagated here — pre-existing gap, unchanged by this fix.)
     // -----------------------------------------------------------------------
-    if (bEnableAnimationActive && CurrentStreamSampleRate != 16000)
+    int32 WireRate = CurrentStreamSampleRate;
+    if (const UEstuaryDeveloperSettings* Settings = UEstuaryDeveloperSettings::Get())
     {
-        UE_LOG(LogEstuary, Warning,
-            TEXT("[AudioPlayer] EnableAnimation requires 16000 Hz but StreamSampleRate=%d. "
-                 "Coercing to 16000. Update UEstuaryDeveloperSettings.AudioSampleRate."),
-            CurrentStreamSampleRate);
-        CurrentStreamSampleRate = 16000;
+        WireRate = Settings->AudioSampleRate;
+    }
+    if (bEnableAnimationActive)
+    {
+        if (WireRate != 16000)
+        {
+            UE_LOG(LogEstuary, Warning,
+                TEXT("[AudioPlayer] EnableAnimation requires 16000 Hz but AudioSampleRate=%d. "
+                     "Coercing to 16000. Update UEstuaryDeveloperSettings.AudioSampleRate."),
+                WireRate);
+        }
+        WireRate = 16000;
+    }
+    if (WireRate > 0 && CurrentStreamSampleRate != WireRate)
+    {
+        UE_LOG(LogEstuary, Log,
+            TEXT("[AudioPlayer] Wave is at %d Hz but bot_voice wire rate is %d Hz — reinitialising procedural wave."),
+            CurrentStreamSampleRate, WireRate);
+        if (bIsPlaying) { Stop(); bIsPlaying = false; }
         if (StreamingSound)
         {
-            StreamingSound->SetSampleRate(16000);
+            StreamingSound->ResetAudio();
+            StreamingSound->SetSampleRate(WireRate);
+            StreamingSound->NumChannels = 1;
         }
+        TotalBytesQueued = 0;
+        CurrentStreamSampleRate = WireRate;
         // The AEC mirror may hold bytes recorded at the old rate; PumpAecReference
         // labels pushes with the CURRENT rate, so drop them rather than feed the APM
         // a wrong-rate reference (the baseline resyncs via the empty-FIFO branch).

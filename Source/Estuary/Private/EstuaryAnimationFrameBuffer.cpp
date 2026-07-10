@@ -195,10 +195,10 @@ TEstuaryAnimationFrameBuffer<FEstuaryBotAnimation>::GetInterpolatedFrame(float A
 
 // ---------------------------------------------------------------------------
 // BODY specialization: GetInterpolatedFrame for FEstuaryBotPose.
-// Per-bone FQuat::Slerp on rotations + per-axis FVector::Lerp on hips
-// translations (HipsWorld + HipsLocalToFloor). Iterates the smaller of
-// Prev/Next.Bones.Num() defensively (J=52 fixed at the public surface,
-// but the buffer guarantees length-flex).
+// Per-bone FQuat::Slerp on rotations + per-axis FVector::Lerp on the root
+// translation (HipsWorld). Iterates the smaller of Prev/Next.Bones.Num()
+// defensively (J=63 enforced at the receiver's ingest gate; the buffer
+// stays length-flex).
 // ---------------------------------------------------------------------------
 
 template<>
@@ -233,7 +233,7 @@ TEstuaryAnimationFrameBuffer<FEstuaryBotPose>::GetInterpolatedFrame(float AudioT
     Result.Bones.Reset(Prev.Bones.Num());
 
     // GestureSync wire is stable per FrameIndex — index i maps 1:1 between Prev and Next.
-    // J=52 fixed at public surface; buffer iterates min length defensively.
+    // J=63 enforced at the receiver's ingest gate; buffer iterates min length defensively.
     const int32 N = FMath::Min(Prev.Bones.Num(), Next.Bones.Num());
     for (int32 i = 0; i < N; ++i)
     {
@@ -246,8 +246,7 @@ TEstuaryAnimationFrameBuffer<FEstuaryBotPose>::GetInterpolatedFrame(float AudioT
         B.Quat = FVector4(Slerped.X, Slerped.Y, Slerped.Z, Slerped.W);
         Result.Bones.Add(B);
     }
-    Result.HipsWorld        = FMath::Lerp(Prev.HipsWorld,        Next.HipsWorld,        Alpha);
-    Result.HipsLocalToFloor = FMath::Lerp(Prev.HipsLocalToFloor, Next.HipsLocalToFloor, Alpha);
+    Result.HipsWorld = FMath::Lerp(Prev.HipsWorld, Next.HipsWorld, Alpha);
     return Result;
 }
 

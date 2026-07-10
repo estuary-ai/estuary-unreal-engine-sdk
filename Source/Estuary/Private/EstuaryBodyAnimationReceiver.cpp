@@ -3,8 +3,8 @@
 // Pitfall 1:  All UObject touches on the game thread — TickComponent + BeginPlay guarantee this.
 // Pitfall 2:  HandleBotPoseEvent / HandleInterruptAckedEvent are UFUNCTION() (see header).
 // Pitfall 3:  TWeakObjectPtr cached in BeginPlay; stale-pointer defense via .Get() null-checks.
-// Pitfall 6:  LastPublishedTransforms.Reserve(52) at BeginPlay; FQuat::Slerp + FVector::Lerp
-//             don't allocate; DataTable lookup is O(1).
+// Pitfall 6:  LastPublishedTransforms.Reserve(EstuaryMHR::kNumBones) at construction;
+//             FQuat::Slerp + FVector::Lerp don't allocate.
 // Pitfall 7:  ZERO LiveLink/* includes — receiver consumes IEstuaryBodyLiveLinkPublisher plain
 //             C++ interface via FEstuaryLiveLinkBridge service-locator.
 // Pitfall 18: AudioTimeSec comes from UEstuaryAudioPlayerComponent::GetPlaybackTimeSeconds.
@@ -25,97 +25,17 @@
 #include "EstuaryBodyAnimationReceiver.h"
 #include "EstuaryLog.h"
 #include "EstuaryBodyFrameTransform.h"
-#include "EstuaryBodyBoneRemap.h"
+#include "EstuaryMHRRig.h"
 #include "EstuaryPlayheadMath.h"
 #include "Engine/SkeletalMesh.h"
 #include "ReferenceSkeleton.h"
 
-namespace
-{
-    // 2026-05-05: GestureSync server (Blender-anatomical wire names per
-    // the body model's canonical bone order — `hips`,
-    // `leftUpperArm`, `leftLowerLeg`, etc.) → SK_GestureSyncSource skeleton
-    // (SMPL-X canonical names — `pelvis`, `left_shoulder`, `left_knee`, etc.).
-    // SK_GestureSyncSource is now the OFFICIAL SMPL-X male FBX from SMPL-X's Unity
-    // demo project (Models/smplx-male.fbx) — proper anatomical bind pose,
-    // proper heat-equilibrium skin weights, 22 body + 30 finger bones, plus
-    // 3 face bones we don't drive (jaw, left_eye_smplhf, right_eye_smplhf).
-    //
-    // Earlier doc-comments referenced VRM-canonical wire names (`leftArm`,
-    // `leftForeArm`, `leftUpLeg`, `leftLeg`) — that turned out to be wrong;
-    // verifying GestureSync's CANONICAL_22_BONE_NAMES showed the wire is and always
-    // has been Blender-anatomical. The previous remap entries with VRM keys
-    // were dead code.
-    //
-    // Mapping covers the full 52 GestureSync wire bones (22 body + 30 fingers).
-    // Bones that are identity-named on both sides (`neck`, `head`) are listed
-    // for documentation; bones not in the map (none in current schema) pass
-    // through unchanged.
-    static FName RemapGestureSyncToSkeletonBoneName(const FName& InGestureSyncName)
-    {
-        static const TMap<FName, FName> Map = {
-            // Body 22 bones (CANONICAL_22_BONE_NAMES → SMPL-X canonical)
-            { TEXT("hips"),           TEXT("pelvis")         },
-            { TEXT("leftUpperLeg"),   TEXT("left_hip")       },
-            { TEXT("rightUpperLeg"),  TEXT("right_hip")      },
-            { TEXT("spine"),          TEXT("spine1")         },
-            { TEXT("leftLowerLeg"),   TEXT("left_knee")      },
-            { TEXT("rightLowerLeg"),  TEXT("right_knee")     },
-            { TEXT("chest"),          TEXT("spine2")         },
-            { TEXT("leftFoot"),       TEXT("left_ankle")     },
-            { TEXT("rightFoot"),      TEXT("right_ankle")    },
-            { TEXT("upperChest"),     TEXT("spine3")         },
-            { TEXT("leftToes"),       TEXT("left_foot")      },
-            { TEXT("rightToes"),      TEXT("right_foot")     },
-            { TEXT("neck"),           TEXT("neck")           },
-            { TEXT("leftShoulder"),   TEXT("left_collar")    },
-            { TEXT("rightShoulder"),  TEXT("right_collar")   },
-            { TEXT("head"),           TEXT("head")           },
-            { TEXT("leftUpperArm"),   TEXT("left_shoulder")  },
-            { TEXT("rightUpperArm"),  TEXT("right_shoulder") },
-            { TEXT("leftLowerArm"),   TEXT("left_elbow")     },
-            { TEXT("rightLowerArm"),  TEXT("right_elbow")    },
-            { TEXT("leftHand"),       TEXT("left_wrist")     },
-            { TEXT("rightHand"),      TEXT("right_wrist")    },
-            // Fingers 30 (camelCase → snake_case; left + right × 5 fingers × 3 phalanges)
-            { TEXT("leftIndex1"),    TEXT("left_index1")    },
-            { TEXT("leftIndex2"),    TEXT("left_index2")    },
-            { TEXT("leftIndex3"),    TEXT("left_index3")    },
-            { TEXT("leftMiddle1"),   TEXT("left_middle1")   },
-            { TEXT("leftMiddle2"),   TEXT("left_middle2")   },
-            { TEXT("leftMiddle3"),   TEXT("left_middle3")   },
-            { TEXT("leftPinky1"),    TEXT("left_pinky1")    },
-            { TEXT("leftPinky2"),    TEXT("left_pinky2")    },
-            { TEXT("leftPinky3"),    TEXT("left_pinky3")    },
-            { TEXT("leftRing1"),     TEXT("left_ring1")     },
-            { TEXT("leftRing2"),     TEXT("left_ring2")     },
-            { TEXT("leftRing3"),     TEXT("left_ring3")     },
-            { TEXT("leftThumb1"),    TEXT("left_thumb1")    },
-            { TEXT("leftThumb2"),    TEXT("left_thumb2")    },
-            { TEXT("leftThumb3"),    TEXT("left_thumb3")    },
-            { TEXT("rightIndex1"),   TEXT("right_index1")   },
-            { TEXT("rightIndex2"),   TEXT("right_index2")   },
-            { TEXT("rightIndex3"),   TEXT("right_index3")   },
-            { TEXT("rightMiddle1"),  TEXT("right_middle1")  },
-            { TEXT("rightMiddle2"),  TEXT("right_middle2")  },
-            { TEXT("rightMiddle3"),  TEXT("right_middle3")  },
-            { TEXT("rightPinky1"),   TEXT("right_pinky1")   },
-            { TEXT("rightPinky2"),   TEXT("right_pinky2")   },
-            { TEXT("rightPinky3"),   TEXT("right_pinky3")   },
-            { TEXT("rightRing1"),    TEXT("right_ring1")    },
-            { TEXT("rightRing2"),    TEXT("right_ring2")    },
-            { TEXT("rightRing3"),    TEXT("right_ring3")    },
-            { TEXT("rightThumb1"),   TEXT("right_thumb1")   },
-            { TEXT("rightThumb2"),   TEXT("right_thumb2")   },
-            { TEXT("rightThumb3"),   TEXT("right_thumb3")   },
-        };
-        if (const FName* Mapped = Map.Find(InGestureSyncName))
-        {
-            return *Mapped;
-        }
-        return InGestureSyncName;
-    }
-}
+// 2026-07-02 MHR migration: the 52-entry SMPL-X wire→skeleton name-remap TMap
+// (RemapGestureSyncToSkeletonBoneName) that lived here is DELETED. The generated
+// MHR FBX carries the wire bone names verbatim (root, l_upleg, ..., c_head), so
+// the receiver publishes wire FNames directly; topology constants come from the
+// generated EstuaryMHRRig.h (authority: SARAH models/rig.py via
+// scripts/generate_mhr_wire_assets.py).
 
 #include "EstuaryAnimationFrameBuffer.h"
 #include "EstuaryCharacterComponent.h"
@@ -128,7 +48,6 @@ namespace
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
-#include "Engine/DataTable.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Misc/App.h"
 #include "EngineUtils.h"  // TActorIterator for the GestureSyncSourceMesh asset force-set scan
@@ -160,7 +79,7 @@ UEstuaryBodyAnimationReceiver::UEstuaryBodyAnimationReceiver()
     PrimaryComponentTick.bCanEverTick = true;
     PrimaryComponentTick.bStartWithTickEnabled = true;
     // Pitfall 6: pre-allocate the per-tick scratchpad so the publish path never reallocates.
-    LastPublishedTransforms.Reserve(52);
+    LastPublishedTransforms.Reserve(EstuaryMHR::kNumBones);
 }
 
 void UEstuaryBodyAnimationReceiver::BeginPlay()
@@ -278,11 +197,12 @@ void UEstuaryBodyAnimationReceiver::BeginPlay()
 
     bSchemaEnsuredForCurrentMessage = false;
 
-    // 2026-06-10: the bundled metahuman_common_v1.json bind-pose load was removed
-    // along with the interrupt ramp-to-bind-pose. The file shipped all-identity
-    // quats — the T-pose under the VRM identity-bind convention — AND the
-    // cache was keyed by GestureSync wire names while the ramp looked it up by
-    // post-remap skeleton names, so the lookup missed to FQuat::Identity anyway.
+    // 2026-06-10: the bundled bind-pose JSON load was removed along with the
+    // interrupt ramp-to-bind-pose. The file shipped all-identity quats — the
+    // T-pose under the VRM identity-bind convention — AND the cache was keyed
+    // by GestureSync wire names while the ramp looked it up by post-remap
+    // skeleton names, so the lookup missed to FQuat::Identity anyway. (The
+    // JSON file itself was deleted in Task 17 — it had zero remaining consumers.)
     // The server-side bind registry is unaffected.
 }
 
@@ -307,10 +227,10 @@ void UEstuaryBodyAnimationReceiver::EndPlay(const EEndPlayReason::Type EndPlayRe
 }
 
 // ---------------------------------------------------------------------------
-// Subject naming helper — "<characterId>_Body".
+// Subject naming helper — "<characterId>_Body_GestureSync".
 // Single-place enforcement of the body subject convention. Face stays bare-id
-// (so v1.0 face ABPs continue to work); body always suffixes "_Body" so face
-// and body subjects can coexist on the same actor.
+// (so v1.0 face ABPs continue to work); body always suffixes "_Body_GestureSync"
+// so face and body subjects can coexist on the same actor.
 // ---------------------------------------------------------------------------
 FName UEstuaryBodyAnimationReceiver::ResolveSubjectName() const
 {
@@ -350,13 +270,44 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
     UEstuarySubsystem* Sub = GI ? GI->GetSubsystem<UEstuarySubsystem>() : nullptr;
     if (!Sub) { return; }
 
+    // -----------------------------------------------------------------
+    // Rig gate (SDK_CONTRACT §session_info.animation_capabilities.body.rig;
+    // spec §8 — loud failure, no silent mixed-version frame drops). This
+    // receiver speaks ONLY the MHR63 wire; if the server declares any other
+    // rig, disable the component tick permanently with ONE Error log. The
+    // check latches once session_info has landed (SessionId non-empty);
+    // servers that omit the rig field (bPresent false or empty Rig) pass —
+    // the ==63 ingest count gate below still catches a wrong wire.
+    // -----------------------------------------------------------------
+    if (!bRigGateLatched)
+    {
+        const FEstuarySessionInfo Info = Sub->GetSessionInfo();
+        if (!Info.SessionId.IsEmpty())
+        {
+            if (Info.AnimationCapabilities.bPresent
+                && !Info.AnimationCapabilities.Body.Rig.IsEmpty()
+                && Info.AnimationCapabilities.Body.Rig != TEXT("mhr63"))
+            {
+                UE_LOG(LogEstuary, Error,
+                    TEXT("[BodyAnimReceiver] session_info body.rig='%s' != 'mhr63' — this "
+                         "client only speaks the MHR63 wire. Body animation DISABLED for "
+                         "this session (component tick off). Update the server or the "
+                         "plugin so both sides are on the same rig."),
+                    *Info.AnimationCapabilities.Body.Rig);
+                SetComponentTickEnabled(false);
+                return;
+            }
+            bRigGateLatched = true;
+        }
+    }
+
     FEstuaryLiveLinkBridge& Bridge = Sub->GetLiveLinkBridge();
     if (!Bridge.IsBodyAvailable()) { return; }
 
     IEstuaryBodyLiveLinkPublisher* Pub = Bridge.GetBodyPublisher();
     if (!Pub) { return; }
 
-    // Resolve subject FName ("<characterId>_Body").
+    // Resolve subject FName ("<characterId>_Body_GestureSync").
     const FName SubjectName = ResolveSubjectName();
 
     // 2026-06-10: the interrupt ramp-to-bind-pose block that lived here was
@@ -559,7 +510,8 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
     // -----------------------------------------------------------------
     const FEstuaryBotPose Interp = Buffer.GetInterpolatedFrame(RelativeAudioTime);
     if (Interp.Bones.Num() == 0) { return; }
-    // J=52 fixed at public surface; receiver iterates Bones.Num() defensively.
+    // J=63 enforced at the ingest gate (HandleBotPoseEvent); iterate
+    // Bones.Num() defensively anyway.
     const int32 NumBones = Interp.Bones.Num();
 
     // (2026-06-09) Removed the 4 Hz [DIAG] per-bone quat dump — it was the main
@@ -576,63 +528,22 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
     // -----------------------------------------------------------------
     if (!bSchemaEnsuredForCurrentMessage)
     {
-        // 2026-05-03: Hardcoded GestureSync 52-bone parent topology (matches
-        // DT_GestureSyncBoneRemap_Identity row order + the body model's canonical bone order
-        // CANONICAL_52_BONE_NAMES). A prior placeholder ("everything child of root")
-        // corrupted the LiveLink skeleton hierarchy and broke parent-relative pose
-        // evaluation in LiveLinkPose, so matching-named bones appeared static.
-        //
-        // 2026-05-05 cleanup (punchlist item 1): comments use Blender-anatomical
-        // names ONLY — same name space the receiver publishes (post
-        // RemapGestureSyncToSkeletonBoneName for body 0-21; pass-through for fingers 22-51).
-        // No MetaHuman bone names appear here; IKR_GestureSyncToMetaHuman handles cross-skel
-        // alignment downstream.
-        static const int32 kGestureSyncBoneParents[52] = {
-            -1,  // 0  hips
-             0,  // 1  leftUpperLeg          -> hips
-             0,  // 2  rightUpperLeg         -> hips
-             0,  // 3  spine                 -> hips
-             1,  // 4  leftLowerLeg          -> leftUpperLeg
-             2,  // 5  rightLowerLeg         -> rightUpperLeg
-             3,  // 6  chest                 -> spine
-             4,  // 7  leftFoot              -> leftLowerLeg
-             5,  // 8  rightFoot             -> rightLowerLeg
-             6,  // 9  upperChest            -> chest
-             7,  // 10 leftToes              -> leftFoot
-             8,  // 11 rightToes             -> rightFoot
-             9,  // 12 neck                  -> upperChest
-             9,  // 13 leftShoulder          -> upperChest
-             9,  // 14 rightShoulder         -> upperChest
-            12,  // 15 head                  -> neck
-            13,  // 16 leftUpperArm          -> leftShoulder
-            14,  // 17 rightUpperArm         -> rightShoulder
-            16,  // 18 leftLowerArm          -> leftUpperArm
-            17,  // 19 rightLowerArm         -> rightUpperArm
-            18,  // 20 leftHand              -> leftLowerArm
-            19,  // 21 rightHand             -> rightLowerArm
-            20, 22, 23,  // 22-24 leftIndex1..3   (root proximal under leftHand)
-            20, 25, 26,  // 25-27 leftMiddle1..3
-            20, 28, 29,  // 28-30 leftPinky1..3
-            20, 31, 32,  // 31-33 leftRing1..3
-            20, 34, 35,  // 34-36 leftThumb1..3
-            21, 37, 38,  // 37-39 rightIndex1..3
-            21, 40, 41,  // 40-42 rightMiddle1..3
-            21, 43, 44,  // 43-45 rightPinky1..3
-            21, 46, 47,  // 46-48 rightRing1..3
-            21, 49, 50,  // 49-51 rightThumb1..3
-        };
-
+        // MHR63 topology from the generated EstuaryMHRRig.h (authority: SARAH
+        // models/rig.py MHR_J63_PARENTS via scripts/generate_mhr_wire_assets.py).
+        // Wire bone names ARE the SK_GestureSyncSource skeleton bone names (the
+        // FBX is generated in wire order/names), so the schema publishes wire
+        // FNames directly — no name-remap layer. A correct parent table matters:
+        // a prior placeholder ("everything child of root") corrupted the LiveLink
+        // skeleton hierarchy and broke parent-relative pose evaluation in
+        // LiveLinkPose. The downstream IK Retargeter asset is the actual
+        // cross-skeleton map; this hierarchy feeds the Live Link panel +
+        // LiveLinkPose evaluation.
         CachedBoneNames.Reset(NumBones);
         CachedBoneParents.Reset(NumBones);
         for (int32 i = 0; i < NumBones; ++i)
         {
-            // 2026-05-04 IKR refactor: publish GestureSync bone names with a thin VRM→Blender
-            // skeleton-name remap so SK_GestureSyncSource (which was FBX-exported with Blender
-            // anatomical names) actually receives the upper/lower arm + leg rotations.
-            // Without the remap LiveLink silently drops 8 bones whose names don't exist
-            // on the source skeleton.
-            CachedBoneNames.Add(RemapGestureSyncToSkeletonBoneName(FName(*Interp.Bones[i].Name)));
-            const int32 ParentIdx = (i < 52) ? kGestureSyncBoneParents[i] : -1;
+            CachedBoneNames.Add(FName(*Interp.Bones[i].Name));
+            const int32 ParentIdx = (i < EstuaryMHR::kNumBones) ? EstuaryMHR::kBoneParents[i] : -1;
             CachedBoneParents.Add(ParentIdx);
         }
         Pub->EnsureSubject(SubjectName, CachedBoneNames, CachedBoneParents);
@@ -640,26 +551,22 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
     }
 
     // -----------------------------------------------------------------
-    // SMPL-X→UE conversion + DataTable bone-name remap into LastPublishedTransforms.
-    // EstuaryBodyFrameTransform::ToUEQuatFromGestureSync(quat, RollOffsetDeg) handles the
-    // global axis swap + sign flip + handedness + per-bone roll.
-    // EstuaryBodyFrameTransform::ToUEHipsFromGestureSync(meters) handles × 100 m→cm
-    // hips conversion (single source of truth).
+    // MHR→UE conversion into LastPublishedTransforms. No name-remap layer:
+    // wire bone names ARE the SK_GestureSyncSource skeleton names (generated
+    // MHR FBX in wire order/names).
+    // EstuaryBodyFrameTransform::ToUEQuatFromMHR — PROVISIONAL component map
+    // until the Phase 5 FK solve against the imported MHR skeleton re-pins it.
+    // EstuaryBodyFrameTransform::ToUEHipsFromMHR — meters-passthrough Y-mirror
+    // (units decision re-derived in Phase 5, documented in the header).
     // -----------------------------------------------------------------
-    // 2026-05-03: Read consumer skeleton's bind-pose local-to-parent translations
-    // so non-hips bones publish their NATURAL rest-pose offsets (not zero).
-    // Without this, every bone reaches its parent's position and the rig collapses
-    // toward origin (head Z ~3cm instead of ~150cm). For hips/pelvis we ADD the
-    // GestureSync hips world delta on top of the bind-pose translation so GestureSync-driven
-    // hip motion still translates the root, but the natural pelvis-vs-root offset
-    // is preserved (otherwise pelvis snaps to 0 when GestureSync hips delta is zero).
-    //
-    // 2026-05-05 IKR refactor: consumer is SK_GestureSyncSource (SMPL-X canonical),
-    // NOT MH directly. The receiver publishes SMPL-X-named bones (`pelvis`,
-    // `left_shoulder`, ...) — these names don't exist on the MH skeleton, so
-    // the legacy MH lookup missed and translation came out 0 → SK_GestureSyncSource
-    // collapsed → IKR retargeted a collapsed pose to MH = MH stuck at A-pose.
-    // Look up bind from SK_GestureSyncSource (the LiveLink consumer mesh) instead.
+    // Bind-pose local-to-parent translations come from the consumer skeleton
+    // (SK_GestureSyncSource) so non-root bones publish their NATURAL rest
+    // offsets (not zero) — without this every bone reaches its parent's
+    // position and the rig collapses toward origin (head Z ~3cm instead of
+    // ~150cm). The ref pose IS the MHR A-pose, so the same lookup also
+    // provides the rest-rotation fallback used by the FingerPolicy override
+    // below (identity != rest on the MHR rig — no separate rest constants).
+    // For the root we ADD the MHR root delta on top of the bind translation.
     const FReferenceSkeleton* RefSkel = nullptr;
     {
         static USkeletalMesh* GestureSyncSrcMesh = LoadObject<USkeletalMesh>(nullptr,
@@ -688,39 +595,53 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
     LastPublishedTransforms.Reset(NumBones);
     for (int32 i = 0; i < NumBones; ++i)
     {
-        // 2026-05-04: VRM-canonical GestureSync server name → SK_GestureSyncSource skeleton (Blender
-        // anatomical) name remap. Mirrors the same remap applied during schema build above
-        // so per-frame transforms align with the schema bone names LiveLink already received.
-        const FName GestureSyncBoneName = RemapGestureSyncToSkeletonBoneName(FName(*Interp.Bones[i].Name));
+        // Wire name == skeleton bone name (generated MHR FBX) — no remap layer.
+        const FName WireBoneName(*Interp.Bones[i].Name);
 
         const FQuat InQuat(
             Interp.Bones[i].Quat.X, Interp.Bones[i].Quat.Y,
             Interp.Bones[i].Quat.Z, Interp.Bones[i].Quat.W);
-        // World-frame conversion (locked, 6-pose math gate).
-        const FQuat OutQuat = EstuaryBodyFrameTransform::ToUEQuatFromGestureSync(InQuat, /*RollOffsetDeg=*/0.0f);
+        // MHR→UE conversion — PROVISIONAL formula until the Phase 5 FK solve
+        // (see EstuaryBodyFrameTransform.h).
+        const FQuat OutQuat = EstuaryBodyFrameTransform::ToUEQuatFromMHR(InQuat);
 
-        // BindLocalT lookup against the resolved RefSkel (typically the MH body skel)
-        // returns INDEX_NONE for GestureSync bone names → BindLocalT stays zero, which is
-        // fine: the IKR's Retarget Pose From Mesh derives target translations from
-        // chain proportions on the target rig, not from per-frame translation values.
+        // Bind-local translation + scale from the source SK ref skeleton (the ref
+        // pose IS the MHR A-pose). Wire names match the skeleton 1:1, so this
+        // lookup hits for every bone on a healthy import; a persistent miss means
+        // the FBX import is broken (Phase 5 import audit asserts names/order).
+        //
+        // SCALE (2026-07-03, found by the Task 25 PIE smoke): the Blender-built
+        // FBX carries the m→cm conversion as a ×100 SCALE on the 'root' bone,
+        // with child bind translations stored in METERS (the retired SMPL-X
+        // import hid this on its extra armature node, which was never a
+        // published subject bone; the MHR import strips that node, so 'root'
+        // itself is the scale carrier). Publishing FTransforms with the default
+        // scale of 1 clobbered root's ×100 in the LiveLink pose and collapsed
+        // every child onto the root (all sockets within ~1 cm). Publish each
+        // bone's REF-POSE scale so the skeleton's own unit convention survives
+        // LiveLink regardless of import style.
         FVector BindLocalT = FVector::ZeroVector;
+        FVector BindLocalScale = FVector::OneVector;
         if (RefSkel)
         {
-            const int32 ChildIdx = RefSkel->FindBoneIndex(GestureSyncBoneName);
+            const int32 ChildIdx = RefSkel->FindBoneIndex(WireBoneName);
             if (ChildIdx != INDEX_NONE)
             {
                 BindLocalT = RefSkel->GetRefBonePose()[ChildIdx].GetTranslation();
+                BindLocalScale = RefSkel->GetRefBonePose()[ChildIdx].GetScale3D();
             }
         }
 
         FTransform Xform;
         Xform.SetRotation(OutQuat);
+        Xform.SetScale3D(BindLocalScale);
 
         if (i == 0)
         {
-            // Pelvis: bind translation (typically zero for GestureSync names) + GestureSync hip delta.
+            // Root: bind translation + MHR root-position delta (meters, agent
+            // frame, pelvis-centred — Y oscillates ~0).
             Xform.SetLocation(BindLocalT
-                              + EstuaryBodyFrameTransform::ToUEHipsFromGestureSync(Interp.HipsWorld));
+                              + EstuaryBodyFrameTransform::ToUEHipsFromMHR(Interp.HipsWorld));
         }
         else
         {
@@ -769,27 +690,44 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
 
     // -----------------------------------------------------------------
     // FingerPolicy override.
-    // Body bones (0..21) always Driven by GestureSync frames; fingers (22..51)
-    // follow the policy. Driven (default) plays GestureSync frames pass-through.
+    // Non-finger MHR63 bones always Driven by GestureSync frames; finger bones
+    // (the interleaved sets 23-39 ∪ 44-60 — see EstuaryMHR::IsFingerIndex) follow
+    // the policy. Driven (default) plays GestureSync frames pass-through.
     // The hold-last-pose path above already covers no-frames behavior for
     // all bones — this branch ONLY overrides fingers when GestureSync frames are
     // flowing and the operator has selected a non-Driven policy.
     // -----------------------------------------------------------------
     if (FingerPolicy != EEstuaryFingerPolicy::Driven)
     {
-        const int32 FingerStartIdx = 22;
-        for (int32 i = FingerStartIdx; i < LastPublishedTransforms.Num() && i < CachedBoneNames.Num(); ++i)
+        // MHR63 fingers are NOT a contiguous tail: right fingers 23-39 and left
+        // fingers 44-60 interleave with clavicles/neck/head, so the old
+        // FingerStartIdx=22 split is invalid. Membership comes from the generated
+        // EstuaryMHR::IsFingerIndex (kRightFingerFirst/Last + kLeftFingerFirst/Last).
+        for (int32 i = 0; i < LastPublishedTransforms.Num() && i < CachedBoneNames.Num(); ++i)
         {
+            if (!EstuaryMHR::IsFingerIndex(i)) { continue; }
+
+            // Rest rotation for this finger bone comes from the source SK ref
+            // skeleton — the ref pose IS the MHR A-pose, and identity != rest on
+            // the MHR rig (non-identity binds). Identity fallback only when the
+            // SK asset failed to load (the BeginPlay warning path already fired).
+            FQuat RestQ = FQuat::Identity;
+            if (RefSkel)
+            {
+                const int32 BoneIdx = RefSkel->FindBoneIndex(CachedBoneNames[i]);
+                if (BoneIdx != INDEX_NONE)
+                {
+                    RestQ = RefSkel->GetRefBonePose()[BoneIdx].GetRotation();
+                }
+            }
+
             switch (FingerPolicy)
             {
             case EEstuaryFingerPolicy::BindPose:
             {
-                // Force finger to rest pose every frame. Overrides the
-                // GestureSync-driven finger transform written above. Identity local
-                // rotation == SK_GestureSyncSource bind for fingers (VRM normalized
-                // semantics) — this matches what the removed bind-pose JSON
-                // resolved to anyway (all-identity quats + key-mismatch miss).
-                LastPublishedTransforms[i].SetRotation(FQuat::Identity);
+                // Force finger to the MHR A-pose rest every frame. Overrides the
+                // GestureSync-driven finger transform written above.
+                LastPublishedTransforms[i].SetRotation(RestQ);
                 break;
             }
             case EEstuaryFingerPolicy::IdleBreath:
@@ -802,12 +740,12 @@ void UEstuaryBodyAnimationReceiver::TickComponent(
             case EEstuaryFingerPolicy::Statue:
             {
                 // Freeze fingers indefinitely. v2.0 simplified semantics:
-                // forces fingers to bind pose (TRUE per-utterance freeze
+                // forces fingers to the A-pose rest (TRUE per-utterance freeze
                 // deferred to v2.x). This is the explicit
                 // "broken state" indicator for QA — never the default;
                 // surfaces "frames stopped flowing but client thought they
                 // were live" as a visible artifact rather than silent freeze.
-                LastPublishedTransforms[i].SetRotation(FQuat::Identity);
+                LastPublishedTransforms[i].SetRotation(RestQ);
                 break;
             }
             case EEstuaryFingerPolicy::Driven:
@@ -877,18 +815,24 @@ void UEstuaryBodyAnimationReceiver::HandleBotPoseEvent(const FEstuaryBotPose& Po
         InterruptedMessageId.Empty();
     }
 
-    // Defensive length check (hard-cut to J=52, but
-    // length-flex defense-in-depth at the receiver tolerates the legacy J=22
-    // wire if some hardware is somehow still on the legacy stream). Anything
-    // else (other than the terminator) gets logged Verbose and dropped.
-    // Terminators are filtered by the subsystem before dispatch — receiver
-    // never sees them — but the buffer's Push silently ignores them too.
-    if (!Pose.IsTerminator() && Pose.Bones.Num() != 52 && Pose.Bones.Num() != 22)
+    // Hard count gate: the MHR63 wire is exactly 63 bones — the legacy 22/52
+    // tolerance is DELETED (SMPL-X retired wholesale; mixed versions must fail
+    // LOUDLY, spec §8 — Error at 1 Hz, not Verbose). Terminators are filtered
+    // by the subsystem before dispatch — receiver never sees them — but the
+    // buffer's Push silently ignores them too.
+    if (!Pose.IsTerminator() && Pose.Bones.Num() != EstuaryMHR::kNumBones)
     {
-        UE_LOG(LogEstuary, Verbose,
-            TEXT("[BodyAnimReceiver] Dropping bot_pose frame with unexpected bone count: "
-                 "got=%d expected=22 or 52 (msg=%s seq=%d)."),
-            Pose.Bones.Num(), *Pose.MessageId, Pose.FrameIndex);
+        const double NowSeconds = FPlatformTime::Seconds();
+        constexpr double kBoneCountErrorIntervalSeconds = 1.0;
+        if (NowSeconds - LastBoneCountErrorLogSeconds >= kBoneCountErrorIntervalSeconds)
+        {
+            LastBoneCountErrorLogSeconds = NowSeconds;
+            UE_LOG(LogEstuary, Error,
+                TEXT("[BodyAnimReceiver] Dropping bot_pose frame with unexpected bone count: "
+                     "got=%d expected=%d (msg=%s seq=%d). Server rig and client are out of "
+                     "sync — check session_info animation_capabilities.body.rig."),
+                Pose.Bones.Num(), EstuaryMHR::kNumBones, *Pose.MessageId, Pose.FrameIndex);
+        }
         return;
     }
 
@@ -910,19 +854,21 @@ void UEstuaryBodyAnimationReceiver::HandleBotPoseEvent(const FEstuaryBotPose& Po
         CurrentMessageId   = Pose.MessageId;
         MessageAudioOffset = NowAudio - FirstFrameLatencyCompSec;
         // Worker emits a continuous silence-fill "idle" utterance between real bot
-        // utterances so GestureSync always streams listening motion. Its message_id is the
-        // sentinel "__sarah_idle__" (the backend idle-frame message id; some
-        // builds also used an "idle:N" prefix). The bot-audio clock freezes between
-        // speech (GetPlaybackTimeSeconds plateaus once the TTS queue drains), so idle
-        // frames are driven off the wall clock; real (TTS) utterances keep audio-clock
-        // anchoring for A/V sync.
+        // utterances so GestureSync always streams listening motion. Idle ids carry
+        // the reserved PREFIX "__sarah_idle__" with a per-resume unique suffix
+        // ("__sarah_idle__#7") so this message-id-change reset fires on every idle
+        // resume — equality matching would silently fall back to the frozen
+        // bot-audio clock. (Some legacy builds used an "idle:N" prefix.) The
+        // bot-audio clock freezes between speech (GetPlaybackTimeSeconds plateaus
+        // once the TTS queue drains), so idle frames are driven off the wall clock;
+        // real (TTS) utterances keep audio-clock anchoring for A/V sync.
         bUseWallClockForCurrentMessage =
             Pose.MessageId.StartsWith(TEXT("idle:")) ||
-            Pose.MessageId == TEXT("__sarah_idle__");
+            Pose.MessageId.StartsWith(TEXT("__sarah_idle__"));
         MessageWallClockOffset = FApp::GetCurrentTime()
                                  - static_cast<double>(FirstFrameLatencyCompSec);
         // Force the publisher to re-EnsureSubject on this utterance's first tick so
-        // any BoneRemapAsset change re-establishes the schema.
+        // the schema is re-established across message rollovers.
         bSchemaEnsuredForCurrentMessage = false;
         // Reset drift-warn throttle so the FIRST drift warning of a new utterance fires
         // immediately instead of waiting for the 1 Hz window.

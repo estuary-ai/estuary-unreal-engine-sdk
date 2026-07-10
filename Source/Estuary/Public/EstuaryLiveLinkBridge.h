@@ -112,7 +112,6 @@ public:
  *
  * The receiver is responsible for:
  *   - Pre-converting SMPL-X→UE quaternions via FEstuaryBodyFrameTransform::ToUEQuatFromGestureSync (UE-05)
- *   - DataTable name remap via UEstuaryBodyBoneRemapLibrary (UE-04)
  *   - Pre-allocating Transforms TArray to avoid per-tick allocation (Pitfall 6)
  * The publisher only sees POST-CONVERSION + POST-REMAP MetaHuman names + UE transforms.
  *

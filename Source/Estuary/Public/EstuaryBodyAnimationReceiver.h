@@ -17,12 +17,14 @@
 //             identity-bind convention, so the old decay snapped the character to
 //             T-pose on every barge-in. The model's idle stream is the only correct
 //             source of rest motion; the client must not invent poses.
-// Subject naming: `<characterId>_Body` — face stays bare-id; body suffixes.
+// Subject naming: `<characterId>_Body_GestureSync` — face stays bare-id; body suffixes.
 //             Single-place enforcement in ResolveSubjectName().
 // Audio clock: Both face and body receivers read SAME WeakAudioComp->GetPlaybackTimeSeconds()
 //             — cross-modality drift impossible by construction (sub-100 ms drift target
 //             trivially satisfied: there is no drift to measure).
-// Bone count: J=52 fixed at public surface; receiver iterates Pose.Bones.Num() defensively.
+// Bone count: J=63 (MHR63 wire) — hard ingest gate (==EstuaryMHR::kNumBones), no
+//             legacy 22/52 tolerance; plus a session rig gate on
+//             session_info.animation_capabilities.body.rig ("mhr63").
 
 #pragma once
 
@@ -43,7 +45,6 @@
 // Forward declarations (Pitfall 23 — minimize public-header include footprint).
 class UEstuaryCharacterComponent;
 class UEstuaryAudioPlayerComponent;
-class UDataTable;
 class USkeletalMeshComponent;
 
 /**
@@ -58,15 +59,19 @@ class USkeletalMeshComponent;
  *     delegates at BeginPlay.
  *   - Buffers frames in TEstuaryAnimationFrameBuffer<FEstuaryBotPose>.
  *   - Each tick:
- *       1) Resolves FEstuaryLiveLinkBridge::GetBodyPublisher() (no-op if unavailable).
- *       2) Reads WeakAudioComp->GetPlaybackTimeSeconds() (shared cross-modality clock).
- *       3) Interpolates against audio time (per-bone FQuat::Slerp + per-hips FVector::Lerp).
- *       4) Applies SMPL-X→UE coord conversion via EstuaryBodyFrameTransform::ToUEQuatFromGestureSync.
- *       5) Applies bone-name remap via DT_GestureSyncBoneRemap_Identity to MetaHuman names.
- *       6) Publishes 52 FTransforms via Bridge.GetBodyPublisher()->PublishFrame.
+ *       1) Checks the session rig gate (session_info animation_capabilities.body.rig
+ *          must be "mhr63" — mismatch disables the component with ONE Error log).
+ *       2) Resolves FEstuaryLiveLinkBridge::GetBodyPublisher() (no-op if unavailable).
+ *       3) Reads WeakAudioComp->GetPlaybackTimeSeconds() (shared cross-modality clock).
+ *       4) Interpolates against audio time (per-bone FQuat::Slerp + per-root FVector::Lerp).
+ *       5) Applies MHR→UE coord conversion via EstuaryBodyFrameTransform::ToUEQuatFromMHR
+ *          (PROVISIONAL formula until the Phase 5 FK solve — see that header).
+ *       6) Publishes 63 FTransforms via Bridge.GetBodyPublisher()->PublishFrame — wire
+ *          bone names ARE the SK_GestureSyncSource skeleton names (generated MHR FBX),
+ *          so there is no name-remap layer; topology from generated EstuaryMHRRig.h.
  *
- * Subject naming: <characterId>_Body. ResolveSubjectName helper appends
- * "_Body" suffix to the bare CharacterId from the sibling UEstuaryCharacterComponent.
+ * Subject naming: <characterId>_Body_GestureSync. ResolveSubjectName helper appends
+ * "_Body_GestureSync" suffix to the bare CharacterId from the sibling UEstuaryCharacterComponent.
  *
  * Interrupt behavior (replaces the earlier ramp-to-bind-pose): on
  * interrupt the buffer is cleared and the receiver HOLDS the last published pose
@@ -74,14 +79,14 @@ class USkeletalMeshComponent;
  * server's idle pump resumes the stream, then slerps from the held pose into the
  * live stream over kResumeBlendSecs (transport-seam concealment only).
  *
- * NOTE: a later revision adds the FingerPolicy override branches AND wires
- * `bAnimationEnabled` to the `UEstuaryDeveloperSettings::bEnableBodyAnimation` global.
- * This revision only handles the `Driven` (default) case.
+ * NOTE: the FingerPolicy override branches are implemented (see TickComponent).
+ * `bAnimationEnabled` is still a per-receiver UPROPERTY only (default true) — it
+ * is not yet wired to the project-wide `UEstuaryDeveloperSettings::bEnableBodyAnimation` global.
  */
 UCLASS(ClassGroup=(Estuary),
        meta=(BlueprintSpawnableComponent,
              DisplayName="Estuary Body Animation Receiver",
-             ToolTip="Production body-animation receiver. Buffers bot_pose frames, interpolates against the audio clock, applies SMPL-X→UE conversion + DataTable bone remap, and publishes 52 FTransforms via the body Live Link bridge. Drop on AEstuaryCharacter alongside UEstuaryCharacterComponent + UEstuaryAudioPlayerComponent."))
+             ToolTip="Production body-animation receiver. Buffers bot_pose frames (MHR 63-joint GestureSync wire), interpolates against the audio clock, applies the MHR→UE conversion, and publishes 63 FTransforms (wire bone names) via the body Live Link bridge. Drop on AEstuaryCharacter alongside UEstuaryCharacterComponent + UEstuaryAudioPlayerComponent."))
 class ESTUARY_API UEstuaryBodyAnimationReceiver : public UActorComponent
 {
     GENERATED_BODY()
@@ -109,14 +114,6 @@ public:
     // -----------------------------------------------------------------------
     // User-configurable properties
     // -----------------------------------------------------------------------
-
-    /** SMPL-X → MetaHuman bone remap DataTable. Default = the bundled
-     *  `/Estuary/DataTables/DT_GestureSyncBoneRemap_Identity` (52-row identity). Clone
-     *  + edit for custom rigs that need per-bone roll-offset deltas (rare). */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Estuary|BodyAnimation",
-              meta=(DisplayName="Bone Remap Asset",
-                    ToolTip="DataTable mapping SMPL-X canonical bone names to MetaHuman names. Use the bundled DT_GestureSyncBoneRemap_Identity for stock MetaHuman; clone + edit for custom rigs."))
-    UDataTable* BoneRemapAsset = nullptr;
 
     /** Finger driving policy. Default `Driven` (live GestureSync frames).
      *  BindPose / IdleBreath / Statue alternatives are wired in a later revision. */
@@ -186,9 +183,9 @@ private:
     // Helpers
     // -----------------------------------------------------------------------
 
-    /** Resolve subject name: <characterId>_Body.
-     *  Resolution: WeakCharComp->GetLiveLinkSubjectName() + "_Body" suffix; falls
-     *  back to "default_Body" if WeakCharComp is invalid. Single-place enforcement
+    /** Resolve subject name: <characterId>_Body_GestureSync.
+     *  Resolution: WeakCharComp->GetLiveLinkSubjectName() + "_Body_GestureSync" suffix; falls
+     *  back to "default_Body_GestureSync" if WeakCharComp is invalid. Single-place enforcement
      *  of the body subject naming convention. */
     FName ResolveSubjectName() const;
 
@@ -264,7 +261,8 @@ private:
      *  stops advancing once the audio thread drains the queue. Idle frames stream
      *  at 30 fps from GestureSync and would all map to the same RelativeAudioTime,
      *  rendering as a single frozen pose. For idle-stream MessageIds (the
-     *  `__sarah_idle__` sentinel, or a legacy `idle:` prefix) we anchor
+     *  `__sarah_idle__` PREFIX — ids are unique per idle resume, e.g.
+     *  `__sarah_idle__#7` — or a legacy `idle:` prefix) we anchor
      *  MessageWallClockOffset = FApp::GetCurrentTime() - latency-comp
      *  and derive RelativeAudioTime from the wall clock, so idle motion plays
      *  smoothly. Real (TTS-driven) utterances keep the audio-clock anchor as the
@@ -280,19 +278,32 @@ private:
     int32  DiagHoldTicksWindow  = 0;   // bind-pose HOLD (underrun) ticks since last [BodyDiag]
     double DiagLastLogSeconds   = 0.0; // throttle anchor for the [BodyDiag] line
 
+    /** Rig gate latch (SDK_CONTRACT §session_info.animation_capabilities.body.rig).
+     *  False until session_info has landed (SessionId non-empty) and body.rig has
+     *  been checked against "mhr63". On mismatch the component tick is disabled
+     *  permanently for the play session with ONE Error log — no silent frame
+     *  drops between mixed client/server versions (spec §8). */
+    bool bRigGateLatched = false;
+
+    /** 1 Hz throttle anchor for the bone-count Error in HandleBotPoseEvent
+     *  (non-terminator frames with Bones.Num() != EstuaryMHR::kNumBones are
+     *  dropped with a LOUD Error, not Verbose — spec §8). */
+    double LastBoneCountErrorLogSeconds = 0.0;
+
     /** True only on the first frame of a new utterance; receiver calls
      *  Pub->EnsureSubject(SubjectName, BoneNames, BoneParents) to (re)build the
      *  per-subject skeleton schema. */
     bool bSchemaEnsuredForCurrentMessage = false;
 
     /** Pre-allocated per-tick scratchpad to avoid per-tick allocation (Pitfall 6 —
-     *  Reserve(52) at BeginPlay). Reused across ramp + active-publish paths.
-     *  Index 0 = hips with translation; rest pure rotation. */
+     *  Reserve(EstuaryMHR::kNumBones=63) at construction). Reused across HOLD +
+     *  active-publish paths. Index 0 = root with translation; rest pure rotation. */
     TArray<FTransform> LastPublishedTransforms;
 
-    /** Cached schema (built once per BoneRemapAsset; passed to EnsureSubject on
-     *  first publish of each new utterance). 52-entry MetaHuman bone-name array
-     *  + 52-entry parent-index array. */
+    /** Cached schema (passed to EnsureSubject on first publish of each new
+     *  utterance). 63-entry MHR wire-name array (wire name == skeleton bone name
+     *  on the generated MHR FBX) + 63-entry parent-index array from the generated
+     *  EstuaryMHR::kBoneParents table. */
     TArray<FName> CachedBoneNames;
     TArray<int32> CachedBoneParents;
 };

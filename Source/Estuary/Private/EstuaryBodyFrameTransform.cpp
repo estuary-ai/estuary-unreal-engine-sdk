@@ -2,9 +2,9 @@
 // + EConversionFailureModeToString.
 // Pitfall 23: IWYU only, no CoreMinimal.h.
 //
-// All other helpers (kHipsMetersToCm, ToUEQuatFromGestureSync, ToUEHipsFromGestureSync) are
-// inline in the header — this .cpp exists solely for the diagnostic helper, which
-// is large enough (~30 LOC) and only needed in test/error paths to warrant moving
+// All other helpers (ToUEQuatFromMHR, ToUEHipsFromMHR) are inline in the
+// header — this .cpp exists solely for the diagnostic helper, which is large
+// enough (~30 LOC) and only needed in test/error paths to warrant moving
 // out of the header.
 
 #include "EstuaryBodyFrameTransform.h"
@@ -22,8 +22,9 @@ namespace EstuaryBodyFrameTransform
         // rotated bind-pose or a purely numerical drift).
         //
         // Residual variants assume the math helper produced Expected via the
-        // canonical formula q_ue = (-qz, -qx, -qy, qw). Each variant simulates
-        // a one-step deviation from the canonical formula:
+        // canonical (PROVISIONAL, Phase 5 re-pins) formula
+        // q_ue = (-qx, qy, -qz, qw). Each variant simulates a one-step
+        // deviation from the canonical formula:
         //   AxisSwap   — implementer forgot to negate vector components AND
         //                swapped Y↔Z without the full xyz remap (Y↔Z swap only)
         //   SignFlip   — implementer negated only X (not all of xyz)

@@ -90,6 +90,17 @@ public:
     void StopListening();
 
     /**
+     * Stop capture WITHOUT emitting stop_voice or flushing queued audio to the
+     * server. For when the SERVER has already released the voice session
+     * (voice_timeout / session_timeout / transport close) — emitting into the
+     * closed stream is the stale-voice-state bug class (hot mic + a client that
+     * still thinks voice is active). Queued chunks are discarded. Safe to call
+     * when not capturing (no-op). Called by
+     * UEstuarySubsystem::ReleaseVoiceResourcesLocal; apps normally never need it.
+     */
+    void StopCaptureLocal();
+
+    /**
      * Set the user-initiated mute flag.
      * When true, captured audio is DROPPED (not emitted) but capture continues.
      * This flag is never auto-toggled by the SDK — it reflects user intent only.
@@ -151,6 +162,11 @@ private:
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /** Stop the platform capture device (RAI or built-in FAudioCapture) and clear
+     *  its callback. Shared by StopListening (server-notify path) and
+     *  StopCaptureLocal (local-release path — no server emits). */
+    void StopCaptureDevice();
 
     /** Bind OnSttResponse on the sibling UEstuaryCharacterComponent for auto-barge-in. */
     void BindSttResponseForBargeIn();
