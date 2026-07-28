@@ -603,6 +603,12 @@ private:
     /** Receive `memory_updated` from bridge (game-thread guaranteed). Broadcasts OnMemoryUpdated. */
     void HandleMemoryUpdated(const FEstuaryMemoryUpdated& Memory);
 
+    /** Receive `client_action` from bridge (game-thread guaranteed). Stamps CharacterId
+     *  from session_info (not on the wire) and routes to the matching registered
+     *  component — same routing as HandleBotResponse. Fire-on-arrival per
+     *  SDK_CONTRACT §client_action (contract v1.9). */
+    void HandleClientAction(const FEstuaryClientAction& Action);
+
     /** Receive `session_timeout` from bridge (game-thread guaranteed). Sets
      *  bServerEndedSession (reconnect suppression), releases local voice resources,
      *  and broadcasts OnSessionTimeout. Does NOT SetState — the transport close that

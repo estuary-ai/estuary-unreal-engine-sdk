@@ -283,6 +283,27 @@ void UEstuaryCharacterComponent::HandleBotResponseFromSubsystem(const FEstuaryBo
     }
 }
 
+void UEstuaryCharacterComponent::HandleClientActionFromSubsystem(const FEstuaryClientAction& Action)
+{
+    // Called on game thread by UEstuarySubsystem::HandleClientAction.
+    check(IsInGameThread());
+
+    if (!bIsRegistered)
+    {
+        // Can happen in the window between EndPlay unregistering and the GC destroying
+        // the subsystem entry — drop silently.
+        return;
+    }
+
+    UE_LOG(LogEstuary, Log,
+        TEXT("[EstuaryCharacterComponent] Action received '%s': name=%s args=%d message_id=%s"),
+        *CachedCharacterId, *Action.Name, Action.Arguments.Num(), *Action.MessageId);
+
+    // Broadcast to Blueprint — fire-on-arrival per SDK_CONTRACT §client_action:
+    // trigger the action now; it is not synchronized to TTS playback position.
+    OnClientAction.Broadcast(Action);
+}
+
 void UEstuaryCharacterComponent::HandleInterruptAckFromSubsystem(const FEstuaryInterruptPayload& Payload)
 {
     check(IsInGameThread());

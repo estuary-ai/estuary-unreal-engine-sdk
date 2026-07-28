@@ -160,6 +160,7 @@ Contract Version: 1.0 | Transport: Socket.IO v4 / `/sdk` namespace
 | `scene_graph_subscribe` | N/A | Non-AR desktop+mobile platform; world-model scene understanding belongs to the Lens Studio + Unity AR SDKs (no real-world scene source). `scene_graph: false` |
 | `device_pose` | N/A | Non-AR desktop+mobile platform; tracked 6DoF device pose belongs to the Lens Studio + Unity AR SDKs (no real-world pose source). `device_pose: false` |
 | `memory_updated` | Shipped | `FOnEstuaryMemoryUpdated` delegate (`FEstuaryMemoryUpdated` + `FEstuaryMemoryData[]`); top-level snake_case, `new_memories[]` items camelCase (only camelCase-array payload in the SDK) |
+| `client_action` (contract v1.9) | Shipped | `UEstuaryCharacterComponent::OnClientAction` delegate (`FEstuaryClientAction`); typed in-world action calls via native LLM function calling (SCRUM-202). Exactly once per call, fire-on-arrival (not synced to TTS); `Arguments` stringified `TMap<FString,FString>` (numbers invariant, booleans lowercase) |
 | encounter / character / share REST APIs | Out of scope | Host-app/dashboard concern (Firebase / dev-API-key auth, character authoring + share minting); UE SDK is a realtime conversation runtime with no HTTP module by design |
 | encounter Socket.IO (`subscribe_encounter` / `encounter_*`) | Deferred | Lens Studio only at MVP; two-NPC-room feature, low fit for a single-MetaHuman SDK |
 

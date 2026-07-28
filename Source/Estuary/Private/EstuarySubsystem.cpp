@@ -240,6 +240,11 @@ void UEstuarySubsystem::BindBridgeSinks()
         if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleMemoryUpdated(Memory); }
     };
 
+    Bridge->OnClientAction = [WeakThis](const FEstuaryClientAction& Action)
+    {
+        if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleClientAction(Action); }
+    };
+
     Bridge->OnSessionTimeoutSink = [WeakThis](const FEstuarySessionTimeout& Timeout)
     {
         if (UEstuarySubsystem* Self = WeakThis.Get()) { Self->HandleSessionTimeout(Timeout); }
@@ -1032,6 +1037,35 @@ void UEstuarySubsystem::HandleBotResponse(const FEstuaryBotResponse& InResponse)
                 TEXT("[Subsystem] VLM response complete: request_id=%s char='%s'"),
                 *Response.MessageId, *CameraCharacterId);
         }
+    }
+}
+
+void UEstuarySubsystem::HandleClientAction(const FEstuaryClientAction& InAction)
+{
+    check(IsInGameThread());
+
+    // Populate CharacterId from session (not present on wire; client-side routing
+    // field — same pattern as HandleBotResponse).
+    FEstuaryClientAction Action = InAction;
+    Action.CharacterId = SessionInfo.CharacterId;
+
+    UE_LOG(LogEstuary, Log,
+        TEXT("[Subsystem] client_action: name=%s args=%d char='%s' message_id=%s"),
+        *Action.Name, Action.Arguments.Num(), *Action.CharacterId, *Action.MessageId);
+
+    // Route to the registered component matching this session's character_id.
+    TWeakObjectPtr<UEstuaryCharacterComponent>* Weak = RegisteredCharacters.Find(Action.CharacterId);
+    if (!Weak || !Weak->IsValid())
+    {
+        UE_LOG(LogEstuary, Warning,
+            TEXT("[Subsystem] HandleClientAction: no registered component for CharacterId='%s' (action=%s message_id=%s)"),
+            *Action.CharacterId, *Action.Name, *Action.MessageId);
+        return;
+    }
+
+    if (UEstuaryCharacterComponent* Comp = Weak->Get())
+    {
+        Comp->HandleClientActionFromSubsystem(Action);
     }
 }
 

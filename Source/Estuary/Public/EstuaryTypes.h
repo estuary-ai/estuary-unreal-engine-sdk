@@ -447,6 +447,76 @@ struct ESTUARY_API FEstuaryVoiceTimeout
 };
 
 // ---------------------------------------------------------------------------
+// FEstuaryClientAction — Server -> Client `client_action` event payload.
+// Wire contract: SDK_CONTRACT.md §client_action (contract v1.9, SCRUM-202).
+//
+// A character-defined in-world action call delivered via native LLM function
+// calling (replaces the legacy inline XML <action .../> tags that rode inside
+// bot_response.text — this SDK never had a tag parser, so nothing dormant
+// remains here). Exactly ONE event per action call; a turn may carry several
+// (in call order). Fire-on-arrival: trigger the action as soon as it arrives —
+// actions are not synchronized to TTS playback position.
+//
+// Fields map to snake_case wire keys:
+//   Name       <- name
+//   Arguments  <- arguments   (object of string|number|boolean values)
+//   MessageId  <- message_id
+//   ChunkIndex <- chunk_index
+//   Timestamp  <- timestamp
+// CharacterId is a CLIENT-ADDED routing field (subsystem copies it in from
+// FEstuarySessionInfo on dispatch, same as FEstuaryBotResponse); NOT on the wire.
+//
+// Arguments are validated server-side against the character's declared
+// AgentAction parameters (types coerced, undeclared arguments dropped) and are
+// stringified here into a Blueprint-friendly TMap<FString,FString>: numbers in
+// invariant form ("2.5", integral values without a decimal point), booleans as
+// lowercase "true"/"false" — the same convention as the Unity / Lens SDKs.
+// ---------------------------------------------------------------------------
+
+/** A typed in-world action call from the character (client_action, contract v1.9).
+ *  Fires exactly once per action call, on arrival (not synced to TTS playback). */
+USTRUCT(BlueprintType)
+struct ESTUARY_API FEstuaryClientAction
+{
+    GENERATED_BODY()
+
+    /** Action name exactly as declared on the character (NOT the sanitized
+     *  function-calling name — an action authored as "wave hello" arrives as such). */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Name", ToolTip = "Action name exactly as declared on the character."))
+    FString Name;
+
+    /** Stringified action arguments keyed by parameter name. Numbers arrive in
+     *  invariant form ("2.5"), booleans as lowercase "true"/"false". Empty for
+     *  parameterless actions. Server-validated against the declared parameters. */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Arguments", ToolTip = "Stringified arguments by parameter name (numbers invariant, booleans lowercase true/false). Empty for parameterless actions."))
+    TMap<FString, FString> Arguments;
+
+    /** Correlation ID — matches the same turn's bot_response / bot_voice stream. */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Message ID", ToolTip = "Correlates the action with the same turn's bot_response / bot_voice stream."))
+    FString MessageId;
+
+    /** Client-side character routing ID — populated by the subsystem on dispatch.
+     *  Never sourced from the wire (client_action has no character_id wire field). */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Character ID", ToolTip = "Client-side character correlation ID (populated by the subsystem on dispatch)."))
+    FString CharacterId;
+
+    /** Sentence counter at the moment the action was emitted (optional anchoring to
+     *  the text stream; not required for correct behavior). -1 = unset / not on wire. */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Chunk Index", ToolTip = "Sentence counter when the action was emitted. -1 sentinel when field missing from wire."))
+    int32 ChunkIndex = -1;
+
+    /** ISO 8601 server emit time. */
+    UPROPERTY(BlueprintReadOnly, Category = "Estuary|Action",
+              meta = (DisplayName = "Timestamp", ToolTip = "ISO 8601 server emit time."))
+    FString Timestamp;
+};
+
+// ---------------------------------------------------------------------------
 // FEstuaryMemoryData — one item of `memory_updated.new_memories[]`.
 // Wire contract: SDK_CONTRACT.md §Shared Data Models / MemoryData.
 //

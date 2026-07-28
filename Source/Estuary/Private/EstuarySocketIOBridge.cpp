@@ -66,6 +66,7 @@ static const TSet<FString> KnownQuotaExceededFields  = { TEXT("error"), TEXT("me
 static const TSet<FString> KnownMemoryUpdatedFields  = { TEXT("agent_id"), TEXT("player_id"), TEXT("memories_extracted"), TEXT("facts_extracted"), TEXT("conversation_id"), TEXT("new_memories"), TEXT("timestamp") };
 static const TSet<FString> KnownSessionTimeoutFields = { TEXT("reason"), TEXT("idle_seconds"), TEXT("timeout_seconds") };
 static const TSet<FString> KnownVoiceTimeoutFields   = { TEXT("reason"), TEXT("idle_seconds"), TEXT("timeout_seconds") };
+static const TSet<FString> KnownClientActionFields   = { TEXT("name"), TEXT("arguments"), TEXT("message_id"), TEXT("chunk_index"), TEXT("timestamp") };
 // MemoryData items use camelCase keys (Memory.to_dict()); sourceMessageTimestamp is
 // emitted by the live server but absent from SDK_CONTRACT.md — kept here so the
 // per-item schema-drift warning does not fire on it.
@@ -851,6 +852,128 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                     TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelf.Pin();
                     if (!Self || Self->Impl->bShuttingDown) { return; }
                     if (Self->OnMemoryUpdated) { Self->OnMemoryUpdated(Out); }
+                });
+            },
+            TEXT("/sdk"));
+    }
+
+    // client_action — typed in-world action calls via native LLM function calling
+    // (SDK_CONTRACT §client_action, contract v1.9 / SCRUM-202). Exactly one event
+    // per action call; fire-on-arrival. `arguments` values arrive as
+    // string|number|boolean JSON (validated server-side against the character's
+    // declared parameters) and are stringified into the Blueprint-friendly
+    // TMap<FString,FString>: numbers invariant ("2.5", integral values without a
+    // decimal point), booleans lowercase "true"/"false" — the same convention as
+    // the Unity / Lens SDKs.
+    {
+        TWeakPtr<FEstuarySocketIOBridge> WeakSelf = AsWeak();
+        Impl->Socket->OnEvent(
+            TEXT("client_action"),
+            [WeakSelf](const FString& EventName, const TSharedPtr<FJsonValue>& EventData)
+            {
+                FEstuaryClientAction Out;
+                TSharedPtr<FJsonObject> JsonObj;
+                if (EventData.IsValid() && EventData->Type == EJson::Object)
+                {
+                    JsonObj = EventData->AsObject();
+                }
+
+                if (!JsonObj.IsValid())
+                {
+                    UE_LOG(LogEstuary, Warning, TEXT("[Bridge] client_action: invalid JSON payload"));
+                }
+                else
+                {
+                    JsonObj->TryGetStringField(TEXT("name"),       Out.Name);
+                    JsonObj->TryGetStringField(TEXT("message_id"), Out.MessageId);
+                    JsonObj->TryGetStringField(TEXT("timestamp"),  Out.Timestamp);
+                    {
+                        int32 IntVal = 0;
+                        if (JsonObj->TryGetNumberField(TEXT("chunk_index"), IntVal)) { Out.ChunkIndex = IntVal; }
+                    }
+
+                    // arguments{}: dynamic keys, scalar string|number|boolean values.
+                    // TPair<FString, ...> materializes an FString key — required for
+                    // UE 5.8 where FJsonObject keys are UE::FSharedString (see the
+                    // file's other Values loops).
+                    const TSharedPtr<FJsonObject>* ArgsObj = nullptr;
+                    if (JsonObj->TryGetObjectField(TEXT("arguments"), ArgsObj) && ArgsObj && ArgsObj->IsValid())
+                    {
+                        Out.Arguments.Reserve((*ArgsObj)->Values.Num());
+                        for (const TPair<FString, TSharedPtr<FJsonValue>>& Arg : (*ArgsObj)->Values)
+                        {
+                            if (!Arg.Value.IsValid()) { continue; }
+
+                            FString ValueStr;
+                            switch (Arg.Value->Type)
+                            {
+                            case EJson::String:
+                                ValueStr = Arg.Value->AsString();
+                                break;
+                            case EJson::Boolean:
+                                ValueStr = Arg.Value->AsBool() ? TEXT("true") : TEXT("false");
+                                break;
+                            case EJson::Number:
+                            {
+                                const double Num = Arg.Value->AsNumber();
+                                const int64 AsInt = (Num > -9.0e18 && Num < 9.0e18)
+                                    ? static_cast<int64>(Num) : 0;
+                                if (static_cast<double>(AsInt) == Num)
+                                {
+                                    // Integral values print without a decimal point
+                                    // ("3", not "3.0") to match Unity/Lens stringification.
+                                    ValueStr = FString::Printf(TEXT("%lld"), AsInt);
+                                }
+                                else
+                                {
+                                    ValueStr = FString::SanitizeFloat(Num, 0);
+                                }
+                                break;
+                            }
+                            default:
+                                // Server coerces arguments to string/number/boolean —
+                                // anything else is schema drift; skip defensively.
+                                UE_LOG(LogEstuary, Verbose,
+                                    TEXT("[Bridge] client_action: skipping non-scalar argument '%s'"), *Arg.Key);
+                                continue;
+                            }
+
+                            Out.Arguments.Add(Arg.Key, MoveTemp(ValueStr));
+                        }
+                    }
+
+                    // Top-level schema-drift warning (Pitfall 19).
+                    TWeakPtr<FEstuarySocketIOBridge> WeakSelfCopy = WeakSelf;
+                    for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : JsonObj->Values)
+                    {
+                        if (!KnownClientActionFields.Contains(Field.Key))
+                        {
+                            TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelfCopy.Pin();
+                            if (Self)
+                            {
+                                FScopeLock Lock(&Self->Impl->WarnedLock);
+                                FString CacheKey = FString::Printf(TEXT("client_action:%s"), *Field.Key);
+                                if (!Self->Impl->WarnedUnknownFields.Contains(CacheKey))
+                                {
+                                    Self->Impl->WarnedUnknownFields.Add(CacheKey);
+                                    UE_LOG(LogEstuary, Verbose,
+                                        TEXT("[Bridge] client_action: unknown field '%s' (schema drift?)"), *Field.Key);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                UE_LOG(LogEstuary, Log,
+                    TEXT("[Bridge] client_action received: name=%s args=%d message_id=%s chunk_index=%d"),
+                    *Out.Name, Out.Arguments.Num(), *Out.MessageId, Out.ChunkIndex);
+
+                AsyncTask(ENamedThreads::GameThread, [WeakSelf, Out]()
+                {
+                    check(IsInGameThread());
+                    TSharedPtr<FEstuarySocketIOBridge> Self = WeakSelf.Pin();
+                    if (!Self || Self->Impl->bShuttingDown) { return; }
+                    if (Self->OnClientAction) { Self->OnClientAction(Out); }
                 });
             },
             TEXT("/sdk"));

@@ -62,6 +62,13 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryBotAnimation,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryBotPose,
     const FEstuaryBotPose&, Pose);
 
+/** Fires when the server delivers a typed in-world action call for this character
+ *  (client_action, contract v1.9 — SCRUM-202). Exactly once per action call.
+ *  Fire-on-arrival: trigger the action as soon as this fires; actions are not
+ *  synchronized to TTS playback position. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEstuaryClientAction,
+    const FEstuaryClientAction&, Action);
+
 // ---------------------------------------------------------------------------
 // UEstuaryCharacterComponent
 // ---------------------------------------------------------------------------
@@ -275,6 +282,19 @@ public:
                       ToolTip = "Fires when the server sends a camera_capture event for this character. Camera component auto-captures if consent is true."))
     FOnEstuaryCameraCaptureRequested OnCameraCaptureRequested;
 
+    /**
+     * Fires when the character performs a typed in-world action (client_action,
+     * contract v1.9 — native LLM function calling, SCRUM-202). Exactly once per
+     * action call; a turn may carry several (in call order). Fire-on-arrival:
+     * trigger the action as soon as this fires — not synced to TTS playback.
+     * Action.Arguments values are stringified (numbers invariant like "2.5",
+     * booleans lowercase "true"/"false"); parameterless actions have an empty map.
+     */
+    UPROPERTY(BlueprintAssignable, Category = "Estuary|Events",
+              meta = (DisplayName = "On Client Action",
+                      ToolTip = "Fires when the character performs a typed in-world action (client_action). Exactly once per call, on arrival. Arguments are stringified key/value pairs."))
+    FOnEstuaryClientAction OnClientAction;
+
     // -----------------------------------------------------------------------
     // Subsystem-internal dispatch (NOT Blueprint-visible; called by UEstuarySubsystem)
     // -----------------------------------------------------------------------
@@ -336,6 +356,10 @@ public:
     /** Called by UEstuaryCameraComponent::HandleCameraCaptureFromSubsystem to also broadcast
      *  the raw server request to Blueprint listeners. Broadcasts OnCameraCaptureRequested. */
     void HandleCameraCaptureRequestedFromSubsystem(const FEstuaryCameraCapture& Capture);
+
+    /** Called by UEstuarySubsystem::HandleClientAction on the game thread.
+     *  Broadcasts OnClientAction (fire-on-arrival, contract v1.9). */
+    void HandleClientActionFromSubsystem(const FEstuaryClientAction& Action);
 
     /**
      * Returns the CharacterId inherited from the owning AEstuaryCharacter.

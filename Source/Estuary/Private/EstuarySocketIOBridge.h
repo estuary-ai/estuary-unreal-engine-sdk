@@ -118,6 +118,11 @@ public:
      *  after a conversation ends. NewMemories items use camelCase wire keys. */
     TFunction<void(const FEstuaryMemoryUpdated&)>           OnMemoryUpdated;
 
+    /** Fired when `client_action` is received — a typed in-world action call via
+     *  native LLM function calling (SDK_CONTRACT §client_action, contract v1.9).
+     *  Exactly one event per action call; fire-on-arrival (not synced to TTS). */
+    TFunction<void(const FEstuaryClientAction&)>            OnClientAction;
+
     /** Fired when `session_timeout` is received — server idle reap. The gateway
      *  disconnects the socket immediately after; the subsystem must suppress its
      *  auto-reconnect for that close (SDK_CONTRACT §session_timeout). */
