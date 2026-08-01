@@ -258,6 +258,22 @@ void FEstuarySocketIOBridge::Connect(const FString& ServerUrl, const FEstuaryAut
                 Payload->SetNumberField(TEXT("audio_sample_rate"), static_cast<double>(A.AudioSampleRate));
                 Payload->SetBoolField  (TEXT("enable_animation"),  A.bEnableAnimation);
                 Payload->SetBoolField  (TEXT("enable_body_animation"), A.bEnableBodyAnimation);
+
+                // capabilities: protocol opt-in, NOT a device declaration
+                // (SDK_CONTRACT v1.10 §Connection > capabilities). client_action is
+                // the one capability field the server defaults to FALSE when absent:
+                // omit it and this session is served the retired XML <action> tag
+                // path, which this plugin has never had a parser for, so client
+                // actions would simply never arrive. Hardcoded rather than driven
+                // off FEstuaryAuthPayload because it states what this build
+                // implements, not what the game configured. Device fields are left
+                // out deliberately — the server defaults those to true.
+                {
+                    TSharedPtr<FJsonObject> Caps = MakeShared<FJsonObject>();
+                    Caps->SetStringField(TEXT("version"), TEXT("1"));
+                    Caps->SetBoolField(TEXT("client_action"), true);
+                    Payload->SetObjectField(TEXT("capabilities"), Caps);
+                }
                 // Diagnostic fields — server ignores unknown fields safely (Pitfall 19).
                 if (!A.ClientVersion.IsEmpty())
                 {
